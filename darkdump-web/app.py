@@ -82,13 +82,22 @@ def _check_tor(proxy_config: dict):
 @app.route('/')
 def index():
     engines = {
+        '__all__': {
+            'name':         'All Engines',
+            'all_engines':  True,
+            'count':        len(Configuration.SEARCH_ENGINES),
+            'filtered':     False,   # includes unfiltered engines, so warn
+            'tor_required': False,   # proxy is still forced on by the UI
+        },
+    }
+    engines.update({
         k: {
             'name':         v['name'],
             'filtered':     v['filtered'],
             'tor_required': v['tor_required'],
         }
         for k, v in Configuration.SEARCH_ENGINES.items()
-    }
+    })
     return render_template('index.html', engines=engines)
 
 
@@ -122,104 +131,167 @@ def search():
         return Response(stream_with_context(err_stream('No query provided.')),
                         mimetype='text/event-stream')
 
-    if engine_key not in Configuration.SEARCH_ENGINES:
+    search_all = engine_key == '__all__'
+
+    if not search_all and engine_key not in Configuration.SEARCH_ENGINES:
         return Response(stream_with_context(err_stream(f"Unknown engine '{engine_key}'.")),
                         mimetype='text/event-stream')
 
-    engine = Configuration.SEARCH_ENGINES[engine_key]
-    if engine['tor_required']:
-        use_proxy = True
+    if search_all:
+        engine_list  = list(Configuration.SEARCH_ENGINES.keys())
+        use_proxy    = True   # most engines are Tor-only; clearnet ones also work via Tor
+        proxy_config = _proxy_cfg()
+    else:
+        engine = Configuration.SEARCH_ENGINES[engine_key]
+        if engine['tor_required']:
+            use_proxy = True
+        engine_list  = [engine_key]
+        proxy_config = _proxy_cfg() if use_proxy else {}
 
-    proxy_config = _proxy_cfg() if use_proxy else {}
     result_queue: queue.Queue = queue.Queue()
+
+    def _fetch_engine(dd, ek, hdrs, active_proxy):
+        if ek == 'ahmia':
+            return dd._fetch_ahmia(query, amount, hdrs, active_proxy)
+        elif ek == 'notevil':
+            return dd._fetch_notevil(query, amount, hdrs, active_proxy or {})
+        elif ek == 'tordex':
+            return dd._fetch_tordex(query, amount, hdrs, active_proxy or {})
+        elif ek == 'tor66':
+            return dd._fetch_tor66(query, amount, hdrs, active_proxy or {})
+        elif ek == 'onionland':
+            return dd._fetch_onionland(query, amount, hdrs, active_proxy or {})
+        elif ek == 'excavator':
+            return dd._fetch_excavator(query, amount, hdrs, active_proxy or {})
+        elif ek == 'torch':
+            return dd._fetch_torch(query, amount, hdrs, active_proxy or {})
+        elif ek == 'darksearch':
+            return dd._fetch_darksearch(query, amount, hdrs, active_proxy or {})
+        elif ek == 'vormweb':
+            return dd._fetch_vormweb(query, amount, hdrs, active_proxy or {})
+        return []
 
     def run_crawl():
         try:
-            if use_proxy:
-                is_tor, tor_ip = _check_tor(proxy_config)
-                if not is_tor:
+            engines_to_run  = list(engine_list)
+            local_proxy     = proxy_config
+            local_use_proxy = use_proxy
+
+            if local_use_proxy:
+                is_tor, tor_ip = _check_tor(local_proxy)
+                if is_tor:
+                    result_queue.put(('tor_ok', {'ip': tor_ip}))
+                elif search_all:
+                    # Keep going with the clearnet-capable engines
+                    engines_to_run = [k for k in engines_to_run
+                                      if not Configuration.SEARCH_ENGINES[k]['tor_required']]
+                    local_proxy, local_use_proxy = {}, False
+                    result_queue.put(('engine', {
+                        'engine': '__tor__', 'name': 'Tor', 'status': 'skipped',
+                        'message': 'Tor is not running — searching clearnet-capable engines only',
+                    }))
+                    if not engines_to_run:
+                        result_queue.put(('error', {
+                            'message': 'Tor is not running or not reachable on localhost:9050.'
+                        }))
+                        return
+                else:
                     result_queue.put(('error', {
                         'message': 'Tor is not running or not reachable on localhost:9050.'
                     }))
                     return
-                result_queue.put(('tor_ok', {'ip': tor_ip}))
 
             headers = {'User-Agent': random.choice(Headers.user_agents)}
             dd = Darkdump()
 
-            results = []
-            if engine_key == 'ahmia':
-                results = dd._fetch_ahmia(query, amount, headers,
-                                          proxy_config if use_proxy else None)
-            elif engine_key == 'notevil':
-                results = dd._fetch_notevil(query, amount, headers, proxy_config)
-            elif engine_key == 'tordex':
-                results = dd._fetch_tordex(query, amount, headers, proxy_config)
-            elif engine_key == 'tor66':
-                results = dd._fetch_tor66(query, amount, headers, proxy_config)
-            elif engine_key == 'onionland':
-                results = dd._fetch_onionland(query, amount, headers, proxy_config)
-            elif engine_key == 'excavator':
-                results = dd._fetch_excavator(query, amount, headers, proxy_config)
-
-            results = dd._filter_blacklisted(results)
-
-            if not results:
-                result_queue.put(('error', {'message': 'No results returned from engine.'}))
-                return
-
-            result_queue.put(('count', {'total': len(results)}))
-
             seen_urls = set()
             seen_meta = set()
             idx = 0
+            grand_total = 0
 
-            for result in results:
-                site_url    = result.get('site_url', '')
-                title       = result.get('title', 'No title available')
-                description = result.get('description', 'No description available')
+            for ek in engines_to_run:
+                eng_i        = Configuration.SEARCH_ENGINES[ek]
+                active_proxy = local_proxy if local_use_proxy else None
 
-                if not site_url or site_url in seen_urls:
-                    continue
+                if search_all:
+                    result_queue.put(('engine', {'engine': ek, 'name': eng_i['name'],
+                                                 'status': 'fetching'}))
 
-                if dedupe:
-                    fp = (
-                        re.sub(r'\s+', ' ', title.strip().lower()),
-                        re.sub(r'\s+', ' ', description.strip().lower()),
-                    )
-                    if fp in seen_meta:
+                try:
+                    results = _fetch_engine(dd, ek, headers, active_proxy)
+                    results = dd._filter_blacklisted(results)
+                except Exception as exc_engine:
+                    if search_all:
+                        result_queue.put(('engine', {'engine': ek, 'name': eng_i['name'],
+                                                     'status': 'error', 'message': str(exc_engine)}))
                         continue
-                    seen_meta.add(fp)
+                    raise
 
-                seen_urls.add(site_url)
-                idx += 1
+                if not search_all:
+                    if not results:
+                        result_queue.put(('error', {'message': 'No results returned from engine.'}))
+                        return
+                    result_queue.put(('count', {'total': len(results)}))
 
-                payload = {
-                    'idx':         idx,
-                    'title':       title,
-                    'description': description,
-                    'url':         site_url,
-                    'scrape_data': None,
-                }
+                engine_count = 0
+                for result in results:
+                    site_url    = result.get('site_url', '')
+                    title       = result.get('title', 'No title available')
+                    description = result.get('description', 'No description available')
 
-                if scrape:
-                    try:
-                        sd = dd._scrape_site(
-                            site_url, headers, proxy_config,
-                            scrape_images=images, debug_mode=False, idx=idx
+                    if not site_url or site_url in seen_urls:
+                        continue
+
+                    if dedupe:
+                        fp = (
+                            re.sub(r'\s+', ' ', title.strip().lower()),
+                            re.sub(r'\s+', ' ', description.strip().lower()),
                         )
-                        if sd:
-                            payload['scrape_data'] = {
-                                'metadata':       sd.get('metadata', {}),
-                                'links_count':    sd.get('links_count', 0),
-                                'emails':         sd.get('emails', []),
-                                'documents':      sd.get('documents', []),
-                                'images_gallery': sd.get('images_gallery', None),
-                            }
-                    except Exception:
-                        pass
+                        if fp in seen_meta:
+                            continue
+                        seen_meta.add(fp)
 
-                result_queue.put(('result', payload))
+                    seen_urls.add(site_url)
+                    idx += 1
+
+                    payload = {
+                        'idx':         idx,
+                        'title':       title,
+                        'description': description,
+                        'url':         site_url,
+                        'scrape_data': None,
+                        'engine':      ek,
+                        'engine_name': eng_i['name'],
+                    }
+
+                    if scrape:
+                        try:
+                            sd = dd._scrape_site(
+                                site_url, headers, local_proxy,
+                                scrape_images=images, debug_mode=False, idx=idx
+                            )
+                            if sd:
+                                payload['scrape_data'] = {
+                                    'metadata':       sd.get('metadata', {}),
+                                    'links_count':    sd.get('links_count', 0),
+                                    'emails':         sd.get('emails', []),
+                                    'documents':      sd.get('documents', []),
+                                    'images_gallery': sd.get('images_gallery', None),
+                                }
+                        except Exception:
+                            pass
+
+                    result_queue.put(('result', payload))
+                    engine_count += 1
+
+                grand_total += engine_count
+
+                if search_all:
+                    result_queue.put(('engine', {'engine': ek, 'name': eng_i['name'],
+                                                 'status': 'ok', 'count': engine_count}))
+
+            if search_all and grand_total == 0:
+                result_queue.put(('error', {'message': 'No results returned from any engine.'}))
 
         except Exception as exc:
             result_queue.put(('error', {'message': str(exc)}))
@@ -229,9 +301,12 @@ def search():
     threading.Thread(target=run_crawl, daemon=True).start()
 
     def stream():
+        # 'all' queries every engine sequentially, so allow more silence
+        # between events before declaring the search stalled.
+        idle_timeout = 120 if not search_all else 300
         while True:
             try:
-                event, data = result_queue.get(timeout=120)
+                event, data = result_queue.get(timeout=idle_timeout)
                 yield _sse(event, data)
                 if event == 'done':
                     break
@@ -263,6 +338,11 @@ def breach():
 
     if not target:
         return Response(stream_with_context(err_stream('No target provided.')),
+                        mimetype='text/event-stream')
+
+    if engine_key == '__all__':
+        return Response(stream_with_context(err_stream(
+                        'Breach mode requires a single engine — pick one from the list.')),
                         mimetype='text/event-stream')
 
     if engine_key not in Configuration.SEARCH_ENGINES:

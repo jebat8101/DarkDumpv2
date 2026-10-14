@@ -1,0 +1,11 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Scraper output (saved pages / scraped images)
+dd_scrape_image_dump/
+
+# Saved result files
+results.json
+results.csv
+results.txt

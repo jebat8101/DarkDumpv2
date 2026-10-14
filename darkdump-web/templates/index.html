@@ -207,7 +207,7 @@ button.abort:hover { background: rgba(248,81,73,0.1); }
         <label>Engine</label>
         <select id="engine">
           {% for key, eng in engines.items() %}
-          <option value="{{ key }}">{{ eng.name }}{% if not eng.filtered %} (unfiltered){% endif %}{% if eng.tor_required %} [Tor]{% endif %}</option>
+          <option value="{{ key }}" {% if key == 'ahmia' %}selected{% endif %}>{{ eng.name }}{% if eng.all_engines %} ({{ eng.count }}){% elif not eng.filtered %} (unfiltered){% endif %}{% if eng.tor_required %} [Tor]{% endif %}</option>
           {% endfor %}
         </select>
       </div>
@@ -296,13 +296,16 @@ function updateEngineUI() {
   const proxyId = currentMode === 'search' ? 'flag-proxy' : 'flag-breach-proxy';
   const proxyBox = document.getElementById(proxyId);
 
-  warn.style.display = !eng.filtered ? 'block' : 'none';
-  if (!eng.filtered)
+  warn.style.display = (eng.all_engines || !eng.filtered) ? 'block' : 'none';
+  if (eng.all_engines)
+    warn.textContent = `Warning: queries ALL ${eng.count} engines, including unfiltered ones. Results may include illegal or harmful content. Use for legitimate research only.`;
+  else if (!eng.filtered)
     warn.textContent = `Warning: ${eng.name} is unfiltered. Results may include illegal or harmful content. Use for legitimate research only.`;
 
   if (proxyBox) {
-    proxyBox.disabled = !!eng.tor_required;
-    if (eng.tor_required) proxyBox.checked = true;
+    const forced = !!eng.tor_required || !!eng.all_engines;
+    proxyBox.disabled = forced;
+    if (forced) proxyBox.checked = true;
   }
 
   const imagesFlag = document.getElementById('images-flag');
@@ -382,8 +385,12 @@ function esc(s) {
 }
 
 function renderResult(d, isBreach) {
-  const eng = engines[document.getElementById('engine').value] || {};
-  let badges = eng.filtered
+  const selected = document.getElementById('engine').value;
+  const eng = engines[d.engine || selected] || {};
+  let badges = '';
+  if (d.engine_name && selected === '__all__')
+    badges += `<span class="badge">${esc(d.engine_name)}</span>`;
+  badges += eng.filtered
     ? '<span class="badge filtered">filtered</span>'
     : '<span class="badge unfiltered">unfiltered</span>';
   if (eng.tor_required) badges += '<span class="badge tor">tor</span>';
@@ -456,6 +463,21 @@ function wireSSE(url, isBreach) {
     appendLog(`Engine returned ${JSON.parse(ev.data).total} candidate(s).`);
   });
 
+  // all-engines progress events
+  evtSource.addEventListener('engine', ev => {
+    const d = JSON.parse(ev.data);
+    if (d.status === 'fetching') {
+      statusEl.textContent = `Querying ${d.name}…`;
+      appendLog(`→ ${d.name}…`);
+    } else if (d.status === 'ok') {
+      appendLog(`${d.name}: ${d.count} result(s)`, d.count > 0 ? 'ok' : 'warn');
+    } else if (d.status === 'skipped') {
+      appendLog(`${d.name}: skipped — ${d.message}`, 'warn');
+    } else {
+      appendLog(`${d.name}: error — ${d.message}`, 'err');
+    }
+  });
+
   // breach-specific events
   evtSource.addEventListener('breach_start', ev => {
     const d = JSON.parse(ev.data);
@@ -511,7 +533,12 @@ btnRun.addEventListener('click', function() {
 
   if (!q) { appendLog('Enter a query.', 'warn'); return; }
 
-  if (!eng.filtered) {
+  if (eng.all_engines) {
+    const ok = confirm(
+      `Warning: this will query ALL ${eng.count} engines, including unfiltered ones.\n\nResults may include illegal or harmful content.\nProceed for legitimate research only?`
+    );
+    if (!ok) return;
+  } else if (!eng.filtered) {
     const ok = confirm(
       `Warning: ${eng.name} is an unfiltered search engine.\n\nResults may include illegal or harmful content.\nProceed for legitimate research only?`
     );
@@ -532,8 +559,9 @@ btnRun.addEventListener('click', function() {
     const dedupe = document.getElementById('flag-dedupe').checked ? '1' : '0';
     const scrape = document.getElementById('flag-scrape').checked ? '1' : '0';
     const images = document.getElementById('flag-images').checked ? '1' : '0';
+    const engineLabel = eng.all_engines ? `ALL (${eng.count} engines, up to ${amount} each)` : engine;
     lastQuery = q; lastEngine = engine;
-    appendLog(`Query: ${q}  ·  Engine: ${engine}  ·  Max: ${amount}  ·  Proxy: ${proxy==='1'?'on':'off'}  ·  Dedupe: ${dedupe==='1'?'on':'off'}  ·  Scrape: ${scrape==='1'?'on':'off'}${images==='1'?' · Images: on':''}`);
+    appendLog(`Query: ${q}  ·  Engine: ${engineLabel}  ·  Max: ${amount}  ·  Proxy: ${proxy==='1'?'on':'off'}  ·  Dedupe: ${dedupe==='1'?'on':'off'}  ·  Scrape: ${scrape==='1'?'on':'off'}${images==='1'?' · Images: on':''}`);
     statusEl.textContent = 'Searching…';
     wireSSE(
       `/search?q=${encodeURIComponent(q)}&engine=${engine}&amount=${amount}&proxy=${proxy}&dedupe=${dedupe}&scrape=${scrape}&images=${images}`,

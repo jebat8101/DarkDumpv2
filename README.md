@@ -60,7 +60,7 @@ MacOS: `brew services start tor`<br/>
 
 ## Search Engines
 
-Six engines are available via `-e` / `--engine`:
+Nine engines are available via `-e` / `--engine`:
 
 | Engine       | Filtered | Requires Tor | Notes                                          |
 |--------------|----------|--------------|------------------------------------------------|
@@ -70,8 +70,21 @@ Six engines are available via `-e` / `--engine`:
 | `tor66`      | **No**   | Yes          | Crawled index with directory — confirmation required |
 | `onionland`  | **No**   | Yes          | Indexes Tor, I2P, and clearnet — confirmation required |
 | `excavator`  | **No**   | Yes          | General dark web index — confirmation required |
+| `torch`      | **No**   | Yes          | Oldest Tor index, huge but stale — confirmation required |
+| `vormweb`    | Yes      | No           | Screens illegal content, badges results by trust level |
+| `darksearch` | **No**   | No           | Offline since January 2022 — kept for API compatibility |
 
 All engines have their results checked against Ahmia's blacklist. Unfiltered engines will prompt for confirmation before executing. This strategy is still not perfect, always use extreme caution and judgement when searching and scraping unfiltered engines. 
+
+### Search All Engines
+
+Select **All Engines** in the web UI dropdown, or pass `-e all` on the CLI, to query every
+configured engine with a single keyword. `-a/--amount` applies per engine, results are
+deduplicated across engines, and every result is labelled with the engine it came from.
+Engines that fail or are offline (like DarkSearch) are skipped with a note instead of
+aborting the run, and when Tor is not running the Tor-only engines are skipped automatically.
+Since this mode includes unfiltered engines, a single confirmation is required before the
+search starts. Breach mode (`--breach`) still requires a single engine.
 
 ## Darkdump Web Preview (Recommended) 
 

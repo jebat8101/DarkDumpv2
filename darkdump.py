@@ -242,6 +242,17 @@ class Configuration:
     #
     # onionland  - Tor-only. Minimal filtering; indexes Tor, I2P, and clearnet.
     #              Results use .result-block .title a with redirect URL decoding.
+    #
+    # torch      - Tor-only. Oldest Tor search engine. Results come from its
+    #              htdig "omega" CGI as a results table. UNFILTERED; huge but
+    #              stale index.
+    #
+    # vormweb    - Clearnet + Tor. Actively screens illegal content and badges
+    #              every result with a trust level (verified/warning/risky).
+    #
+    # darksearch - Clearnet JSON API. UNFILTERED. Public access was discontinued
+    #              in January 2022 and the host no longer resolves; the entry is
+    #              kept so the engine works again if the service ever returns.
     SEARCH_ENGINES = {
         'ahmia': {
             'name': 'Ahmia',
@@ -311,6 +322,43 @@ class Configuration:
             'result_tag': ('div', 'result'),
             'needs_nonce': False,
             'parser': 'excavator',
+        },
+        'torch': {
+            'name': 'Torch',
+            'base': None,
+            'api': None,
+            # Legacy host meta-refreshes to /cgi-bin/omega/omega. Only the P=
+            # query parameter is sent: passing DB= makes the CGI reset the
+            # connection.
+            'onion': 'http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P={query}',
+            'tor_required': True,
+            'filtered': False,
+            'result_tag': ('td', None),
+            'needs_nonce': False,
+            'parser': 'torch',
+        },
+        'vormweb': {
+            'name': 'VormWeb',
+            'base': 'https://vormweb.de',
+            'api': 'https://vormweb.de/en/search?q={query}',
+            # Onion mirrors the clearnet site byte-for-byte (verified 2024).
+            'onion': 'http://volkancfgpi4c7ghph6id2t7vcntenuly66qjt6oedwtjmyj4tkk5oqd.onion/en/search?q={query}',
+            'tor_required': False,
+            'filtered': True,
+            'result_tag': ('div', 'query-box'),
+            'needs_nonce': False,
+            'parser': 'vormweb',
+        },
+        'darksearch': {
+            'name': 'DarkSearch (offline)',
+            'base': 'https://darksearch.io',
+            'api': 'https://darksearch.io/api/search?query={query}&page=1',
+            'onion': None,
+            'tor_required': False,
+            'filtered': False,
+            'result_tag': None,
+            'needs_nonce': False,
+            'parser': 'darksearch',
         },
     }
 
@@ -900,6 +948,202 @@ class Darkdump(object):
 
         return results
 
+    def _fetch_torch(self, query, amount, headers, proxy_config):
+        """
+        Fetch results from Torch via its .onion address (Tor required).
+
+        The legacy Torch host meta-refreshes to its htdig "omega" search CGI,
+        which serves 10 results per page. Pages beyond the first are requested
+        by replaying the page's hidden state fields (xP, xDB, xFILTERS, tkn,
+        ...) together with the page-number button "["; a fresh search therefore
+        only sends P=, since the CGI resets the connection when given partial
+        state. Up to 10 pages are fetched (100 results).
+
+        Each result row is a table cell whose title is a <b><a href> element
+        followed by a <small> snippet.
+
+        Fallback: any <a> pointing to a .onion href.
+
+        NOTE: Torch is completely unfiltered. Results may include illegal or
+        harmful content. Use only for legitimate research purposes.
+        """
+        engine   = Configuration.SEARCH_ENGINES['torch']
+        q        = requests.utils.quote(query)
+        url      = engine['onion'].format(query=q)
+        endpoint = url.split('?')[0]
+        session  = requests.Session()
+
+        results = []
+        seen    = set()
+        page    = 1
+        params  = None
+
+        while len(results) < amount and page <= 10:
+            if page == 1:
+                response = session.get(url, headers=headers, proxies=proxy_config, timeout=60)
+            else:
+                response = session.get(endpoint, headers=headers, proxies=proxy_config,
+                                       params=params, timeout=60)
+
+            if response.status_code != 200:
+                if page == 1:
+                    raise Exception(f"Torch request failed (HTTP {response.status_code})")
+                break
+
+            # The omega page has no meta charset, so rely on the HTTP header
+            # (response.text) instead of letting BeautifulSoup guess from bytes.
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Primary: title anchors inside result table cells
+            new_results = 0
+            for a_tag in soup.select('td b a[href]'):
+                if len(results) >= amount:
+                    break
+                site_url = a_tag['href'].strip()
+                if not site_url.startswith('http') or site_url in seen:
+                    continue
+                seen.add(site_url)
+                new_results += 1
+
+                title = a_tag.get_text(strip=True) or 'No title available'
+                small = a_tag.find_next('small')
+                description = small.get_text(' ', strip=True) if small else ''
+                if not description:
+                    description = 'No description available'
+
+                results.append({
+                    'title':       title,
+                    'description': description[:200],
+                    'site_url':    site_url,
+                })
+
+            # Fallback: scan all .onion hrefs if the table selector found
+            # nothing at all on the first page.
+            if page == 1 and not results:
+                for a_tag in soup.find_all('a', href=lambda h: h and '.onion' in h):
+                    if len(results) >= amount:
+                        break
+                    site_url = a_tag['href'].strip()
+                    if site_url in seen:
+                        continue
+                    seen.add(site_url)
+                    title  = a_tag.get_text(strip=True) or 'No title available'
+                    parent = a_tag.parent
+                    snippet = parent.get_text(' ', strip=True).replace(title, '').strip() if parent else ''
+                    description = snippet[:200] if len(snippet) > 20 else 'No description available'
+                    results.append({'title': title, 'description': description, 'site_url': site_url})
+                return results
+
+            if len(results) >= amount or new_results == 0:
+                break
+
+            # Replay the page's hidden state fields to reach the next page.
+            hidden = {i['name']: i.get('value', '')
+                      for i in soup.find_all('input', attrs={'type': 'hidden'})
+                      if i.get('name')}
+            if not hidden:
+                break
+
+            page += 1
+            params = dict(hidden)
+            params['P'] = query
+            params['['] = str(page)
+
+        return results
+
+    def _fetch_darksearch(self, query, amount, headers, proxy_config):
+        """
+        Fetch results from the DarkSearch JSON API.
+
+        DarkSearch discontinued public access in January 2022 and its host no
+        longer resolves. The original API call is kept intact so the engine
+        works again if the service ever returns; until then this raises a
+        descriptive error.
+
+        NOTE: DarkSearch was completely unfiltered.
+        """
+        engine = Configuration.SEARCH_ENGINES['darksearch']
+        q      = requests.utils.quote(query)
+
+        try:
+            response = requests.get(engine['api'].format(query=q), headers=headers, timeout=20)
+        except requests.RequestException:
+            raise Exception(
+                "DarkSearch has been offline since January 2022 — public access "
+                "was discontinued and darksearch.io no longer resolves."
+            )
+
+        if response.status_code != 200:
+            raise Exception(f"DarkSearch request failed (HTTP {response.status_code})")
+
+        try:
+            data = response.json().get('data', [])
+        except ValueError:
+            raise Exception("DarkSearch returned a non-JSON response.")
+
+        results = []
+        for item in data[:amount]:
+            site_url = (item.get('link') or '').strip()
+            if not site_url:
+                continue
+            results.append({
+                'title':       item.get('title') or 'No title available',
+                'description': item.get('description') or 'No description available',
+                'site_url':    site_url,
+            })
+        return results
+
+    def _fetch_vormweb(self, query, amount, headers, proxy_config):
+        """
+        Fetch results from VormWeb.
+
+        Uses the .onion endpoint when a Tor proxy_config is supplied, otherwise
+        the clearnet site (vormweb.de/en/search) — both serve identical HTML.
+        Each result is a div.query-box whose a#urllink anchor holds the title
+        and URL; the description is the following <li>.
+
+        VormWeb screens illegal content and badges every result with a trust
+        level (verified / warning / risky), so results are filtered by design.
+        """
+        engine = Configuration.SEARCH_ENGINES['vormweb']
+        q      = requests.utils.quote(query)
+
+        if proxy_config:
+            url      = engine['onion'].format(query=q)
+            response = requests.get(url, headers=headers, proxies=proxy_config, timeout=30)
+        else:
+            url      = engine['api'].format(query=q)
+            response = requests.get(url, headers=headers, timeout=20)
+
+        if response.status_code != 200:
+            raise Exception(f"VormWeb request failed (HTTP {response.status_code})")
+
+        soup    = BeautifulSoup(response.content, 'html.parser')
+        results = []
+
+        for box in soup.select('div.query-box'):
+            if len(results) >= amount:
+                break
+            a_tag = box.find('a', id='urllink') or box.find('a', href=True)
+            if not a_tag:
+                continue
+            site_url = a_tag['href'].strip()
+            if not site_url.startswith('http'):
+                continue
+
+            title = a_tag.get_text(strip=True) or 'No title available'
+            li    = box.find('li')
+            description = li.get_text(' ', strip=True) if li else ''
+            if not description or description.lower().startswith('no description'):
+                description = 'No description available'
+
+            results.append({
+                'title':       title,
+                'description': description[:200],
+                'site_url':    site_url,
+            })
+        return results
+
     def _scrape_site(self, site_url, headers, proxy_config, scrape_images, debug_mode, idx):
         """
         Scrape a single onion site for metadata, links, emails, documents,
@@ -962,32 +1206,62 @@ class Darkdump(object):
               output_file=None, dedupe=False):
 
         engine_key = engine_key.lower()
-        if engine_key not in Configuration.SEARCH_ENGINES:
+        search_all = engine_key == 'all'
+
+        if not search_all and engine_key not in Configuration.SEARCH_ENGINES:
             print(f"{Colors.BOLD + Colors.R}Unknown engine '{engine_key}'. "
-                  f"Valid options: {', '.join(Configuration.VALID_ENGINES)}{Colors.END}")
+                  f"Valid options: {', '.join(Configuration.VALID_ENGINES)}, all{Colors.END}")
             return
 
-        engine  = Configuration.SEARCH_ENGINES[engine_key]
+        engine_keys  = list(Configuration.SEARCH_ENGINES) if search_all else [engine_key]
+        engine       = Configuration.SEARCH_ENGINES[engine_key] if not search_all else None
+        engine_label = 'all engines' if search_all else engine['name']
         headers = {'User-Agent': random.choice(Headers.user_agents)}
         proxy_config = {
             'http':  Configuration.__socks5init__,
             'https': Configuration.__socks5init__,
         } if use_proxy else {}
 
-        # Tor-only engines: auto-enable proxy if the user forgot -p
-        if engine['tor_required'] and not use_proxy:
-            print(
-                f"{Colors.BOLD + Colors.O}Warning: {engine['name']} is a Tor-only search engine. "
-                f"Enabling proxy automatically.{Colors.END}"
-            )
+        # Tor-only engines: auto-enable proxy if the user forgot -p ('all'
+        # includes Tor-only engines, so it enables the proxy too)
+        if (search_all or engine['tor_required']) and not use_proxy:
+            if search_all:
+                print(
+                    f"{Colors.BOLD + Colors.O}Note: 'all' queries every configured engine, "
+                    f"including Tor-only ones. Enabling the proxy automatically.{Colors.END}"
+                )
+            else:
+                print(
+                    f"{Colors.BOLD + Colors.O}Warning: {engine['name']} is a Tor-only search engine. "
+                    f"Enabling proxy automatically.{Colors.END}"
+                )
             proxy_config = {
                 'http':  Configuration.__socks5init__,
                 'https': Configuration.__socks5init__,
             }
             use_proxy = True
 
-        # Warn and confirm when using an unfiltered engine
-        if not engine.get('filtered', True):
+        # Warn and confirm when using unfiltered engines
+        if search_all:
+            unfiltered_names = [
+                Configuration.SEARCH_ENGINES[k]['name'] for k in engine_keys
+                if not Configuration.SEARCH_ENGINES[k].get('filtered', True)
+            ]
+            print(
+                f"\n{Colors.BOLD + Colors.R}[!] WARNING: 'all' also queries unfiltered engines: "
+                f"{', '.join(unfiltered_names)}.{Colors.END}\n"
+                f"{Colors.BOLD + Colors.O}    Results may include illegal, harmful, or disturbing content.\n"
+                f"    This tool is intended for legitimate research purposes only.{Colors.END}\n"
+            )
+            try:
+                confirm = input(f"{Colors.BOLD}    Continue with all engines? [y/N]: {Colors.END}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = 'n'
+            if confirm != 'y':
+                print(f"{Colors.BOLD + Colors.R}Aborted.{Colors.END}")
+                return
+            print()
+        elif not engine.get('filtered', True):
             print(
                 f"\n{Colors.BOLD + Colors.R}[!] WARNING: {engine['name']} is an unfiltered search engine.{Colors.END}\n"
                 f"{Colors.BOLD + Colors.O}    Results may include illegal, harmful, or disturbing content.\n"
@@ -1003,7 +1277,7 @@ class Darkdump(object):
             print()
 
         # clearnet_only engines must never go through Tor
-        is_clearnet_only = engine.get('clearnet_only', False)
+        is_clearnet_only = engine.get('clearnet_only', False) if not search_all else False
         if is_clearnet_only and use_proxy:
             print(
                 f"{Colors.BOLD + Colors.O}Note: {engine['name']} is a clearnet-only engine. "
@@ -1014,34 +1288,73 @@ class Darkdump(object):
 
         if (scrape_sites or use_proxy) and not is_clearnet_only:
             if Platform(True).check_tor_connection(proxy_config) is False:
+                if not search_all:
+                    return
+                # Tor is down: keep going with the clearnet-capable engines
+                engine_keys  = [k for k in engine_keys
+                                if not Configuration.SEARCH_ENGINES[k]['tor_required']]
+                proxy_config = {}
+                use_proxy    = False
+                if not engine_keys:
+                    print(f"{Colors.BOLD + Colors.R}No engines left to query without Tor.{Colors.END}")
+                    return
+                print(
+                    f"{Colors.BOLD + Colors.O}Continuing without Tor — "
+                    f"Tor-only engines will be skipped.{Colors.END}\n"
+                )
+
+        if not search_all:
+            print(f"{Colors.BOLD + Colors.C}[ Engine: {engine['name']} ]{Colors.END}\n")
+
+        # Query every selected engine. In 'all' mode a failing engine is
+        # reported and skipped instead of aborting the whole run.
+        results = []
+        for ek in engine_keys:
+            eng_i        = Configuration.SEARCH_ENGINES[ek]
+            active_proxy = proxy_config if use_proxy else None
+
+            if search_all:
+                print(f"{Colors.BOLD + Colors.C}[ Engine: {eng_i['name']} ]{Colors.END}")
+
+            try:
+                if ek == 'ahmia':
+                    r = self._fetch_ahmia(query, amount, headers, active_proxy)
+                elif ek == 'notevil':
+                    r = self._fetch_notevil(query, amount, headers, active_proxy or {})
+                elif ek == 'tordex':
+                    r = self._fetch_tordex(query, amount, headers, active_proxy or {})
+                elif ek == 'tor66':
+                    r = self._fetch_tor66(query, amount, headers, active_proxy or {})
+                elif ek == 'onionland':
+                    r = self._fetch_onionland(query, amount, headers, active_proxy or {})
+                elif ek == 'excavator':
+                    r = self._fetch_excavator(query, amount, headers, active_proxy or {})
+                elif ek == 'torch':
+                    r = self._fetch_torch(query, amount, headers, active_proxy or {})
+                elif ek == 'darksearch':
+                    r = self._fetch_darksearch(query, amount, headers, active_proxy or {})
+                elif ek == 'vormweb':
+                    r = self._fetch_vormweb(query, amount, headers, active_proxy or {})
+                else:
+                    r = []
+            except Exception as e:
+                print(f"{Colors.BOLD + Colors.R}Error fetching results from {eng_i['name']}: {e}{Colors.END}")
+                if search_all:
+                    print()
+                    continue
                 return
 
-        print(f"{Colors.BOLD + Colors.C}[ Engine: {engine['name']} ]{Colors.END}\n")
+            r = self._filter_blacklisted(r) # Extremely important as this increases safe searching
+            for item in r:
+                item['engine'] = eng_i['name']
 
-        # Dispatch to the correct fetcher
-        results = []
-        try:
-            if engine_key == 'ahmia':
-                results = self._fetch_ahmia(query, amount, headers,
-                                            proxy_config if use_proxy else None)
-            elif engine_key == 'notevil':
-                results = self._fetch_notevil(query, amount, headers, proxy_config)
-            elif engine_key == 'tordex':
-                results = self._fetch_tordex(query, amount, headers, proxy_config)
-            elif engine_key == 'tor66':
-                results = self._fetch_tor66(query, amount, headers, proxy_config)
-            elif engine_key == 'onionland':
-                results = self._fetch_onionland(query, amount, headers, proxy_config)
-            elif engine_key == 'excavator':
-                results = self._fetch_excavator(query, amount, headers, proxy_config)
-        except Exception as e:
-            print(f"{Colors.BOLD + Colors.R}Error fetching results from {engine['name']}: {e}{Colors.END}")
-            return
+            if search_all:
+                print(f"  {Colors.BOLD + Colors.G}{len(r)}{Colors.END} result(s)\n")
 
-        results = self._filter_blacklisted(results) # Extremely important as this increases safe searching
+            results.extend(r)
 
         if not results:
-            print(f"{Colors.BOLD + Colors.O}No results returned from {engine['name']}.{Colors.END}")
+            print(f"{Colors.BOLD + Colors.O}No results returned from {engine_label}.{Colors.END}")
             return
 
         saver      = ResultSaver(output_file, query=query, engine=engine_key) if output_file else None
@@ -1055,6 +1368,8 @@ class Darkdump(object):
             site_url    = result['site_url']
             title       = result['title']
             description = result['description']
+            source_note = (f" {Colors.BOLD + Colors.GR}[{result['engine']}]{Colors.END}"
+                           if search_all else '')
 
             if not site_url or site_url in seen_urls:
                 continue
@@ -1077,7 +1392,7 @@ class Darkdump(object):
 
             try:
                 if scrape_sites:
-                    print(f"{Colors.BOLD}{idx}. --- [+] Website: {Colors.END}{Colors.P}{title}{Colors.END}")
+                    print(f"{Colors.BOLD}{idx}. --- [+] Website: {Colors.END}{Colors.P}{title}{Colors.END}{source_note}")
                     print(f"{Colors.BOLD}| Information: {Colors.END}{Colors.G}{description}{Colors.END}")
                     print(f"{Colors.BOLD}| Onion Link: {Colors.END}{Colors.G}{site_url}{Colors.END}")
                     scrape_data = self._scrape_site(
@@ -1086,7 +1401,7 @@ class Darkdump(object):
                     if saver:
                         saver.add(title, description, site_url, scrape_data)
                 else:
-                    print(f"{Colors.BOLD}{idx}. --- [+] Website: {Colors.END}{Colors.P}{title}{Colors.END}")
+                    print(f"{Colors.BOLD}{idx}. --- [+] Website: {Colors.END}{Colors.P}{title}{Colors.END}{source_note}")
                     print(f"{Colors.BOLD}\t Information: {Colors.END}{Colors.G}{description}{Colors.END}")
                     print(f"{Colors.BOLD}| Onion Link: {Colors.END}{Colors.G}{site_url}{Colors.END}\n")
                     if saver:
@@ -1303,6 +1618,10 @@ class Darkdump(object):
             'INFO':     Colors.GR,
         }
 
+        if engine_key.lower() == 'all':
+            print(f"{Colors.BOLD + Colors.R}Breach mode requires a single engine — 'all' is not supported here.{Colors.END}")
+            return
+
         engine = Configuration.SEARCH_ENGINES[engine_key]
         proxy_config = {
             'http':  Configuration.__socks5init__,
@@ -1355,6 +1674,12 @@ class Darkdump(object):
                     results = dd._fetch_onionland(query, amount, headers, proxy_config)
                 elif engine_key == 'excavator':
                     results = dd._fetch_excavator(query, amount, headers, proxy_config)
+                elif engine_key == 'torch':
+                    results = dd._fetch_torch(query, amount, headers, proxy_config)
+                elif engine_key == 'darksearch':
+                    results = dd._fetch_darksearch(query, amount, headers, proxy_config)
+                elif engine_key == 'vormweb':
+                    results = dd._fetch_vormweb(query, amount, headers, proxy_config)
 
                 results = dd._filter_blacklisted(results)
 
@@ -1509,13 +1834,17 @@ def darkdump_main():
     print(notice)
 
     engine_help = (
-        f"search engine to use (default: ahmia). choices: {', '.join(Configuration.VALID_ENGINES)}. "
+        f"search engine to use (default: ahmia). choices: {', '.join(Configuration.VALID_ENGINES)}, all. "
         "ahmia: clearnet + Tor, Tor Project-endorsed, strict abuse filtering. "
         "notevil: Tor-only, Ahmia fork, partial content filtering. "
         "tordex: clearnet + Tor, fully uncensored index (UNFILTERED, prompt required). "
         "tor66: Tor-only, crawled index with directory (UNFILTERED, prompt required). "
         "onionland: Tor-only, indexes Tor + I2P + clearnet (UNFILTERED, prompt required). "
-        "excavator: Tor-only, general dark web index (UNFILTERED, prompt required)."
+        "excavator: Tor-only, general dark web index (UNFILTERED, prompt required). "
+        "torch: Tor-only, oldest Tor search index, large but stale (UNFILTERED, prompt required). "
+        "vormweb: clearnet + Tor, screens illegal content and badges results by trust level. "
+        "darksearch: clearnet JSON API, offline since January 2022 (kept for API compatibility). "
+        "all: query every configured engine in one pass; engines that fail are skipped."
     )
 
     parser = argparse.ArgumentParser(
@@ -1530,7 +1859,7 @@ def darkdump_main():
     parser.add_argument("-d", "--debug",   help="enable debug output", action="store_true")
     parser.add_argument("-u", "--unique",  help="hide duplicate results that share the same title and description (metadata-based deduplication)", action="store_true")
     parser.add_argument("-e", "--engine",  help=engine_help, type=str, default='ahmia',
-                        choices=Configuration.VALID_ENGINES, metavar='ENGINE')
+                        choices=Configuration.VALID_ENGINES + ['all'], metavar='ENGINE')
     parser.add_argument(
         "--breach",
         help=(
