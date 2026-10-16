@@ -79,6 +79,29 @@ def _check_tor(proxy_config: dict):
     return False, 'unknown'
 
 
+def _fetch_engine(dd, ek: str, query: str, amount: int, hdrs: dict, active_proxy):
+    """Dispatch to the Darkdump fetcher for one engine key."""
+    if ek == 'ahmia':
+        return dd._fetch_ahmia(query, amount, hdrs, active_proxy)
+    elif ek == 'notevil':
+        return dd._fetch_notevil(query, amount, hdrs, active_proxy or {})
+    elif ek == 'tordex':
+        return dd._fetch_tordex(query, amount, hdrs, active_proxy or {})
+    elif ek == 'tor66':
+        return dd._fetch_tor66(query, amount, hdrs, active_proxy or {})
+    elif ek == 'onionland':
+        return dd._fetch_onionland(query, amount, hdrs, active_proxy or {})
+    elif ek == 'excavator':
+        return dd._fetch_excavator(query, amount, hdrs, active_proxy or {})
+    elif ek == 'torch':
+        return dd._fetch_torch(query, amount, hdrs, active_proxy or {})
+    elif ek == 'darksearch':
+        return dd._fetch_darksearch(query, amount, hdrs, active_proxy or {})
+    elif ek == 'vormweb':
+        return dd._fetch_vormweb(query, amount, hdrs, active_proxy or {})
+    return []
+
+
 @app.route('/')
 def index():
     engines = {
@@ -150,27 +173,6 @@ def search():
 
     result_queue: queue.Queue = queue.Queue()
 
-    def _fetch_engine(dd, ek, hdrs, active_proxy):
-        if ek == 'ahmia':
-            return dd._fetch_ahmia(query, amount, hdrs, active_proxy)
-        elif ek == 'notevil':
-            return dd._fetch_notevil(query, amount, hdrs, active_proxy or {})
-        elif ek == 'tordex':
-            return dd._fetch_tordex(query, amount, hdrs, active_proxy or {})
-        elif ek == 'tor66':
-            return dd._fetch_tor66(query, amount, hdrs, active_proxy or {})
-        elif ek == 'onionland':
-            return dd._fetch_onionland(query, amount, hdrs, active_proxy or {})
-        elif ek == 'excavator':
-            return dd._fetch_excavator(query, amount, hdrs, active_proxy or {})
-        elif ek == 'torch':
-            return dd._fetch_torch(query, amount, hdrs, active_proxy or {})
-        elif ek == 'darksearch':
-            return dd._fetch_darksearch(query, amount, hdrs, active_proxy or {})
-        elif ek == 'vormweb':
-            return dd._fetch_vormweb(query, amount, hdrs, active_proxy or {})
-        return []
-
     def run_crawl():
         try:
             engines_to_run  = list(engine_list)
@@ -218,7 +220,7 @@ def search():
                                                  'status': 'fetching'}))
 
                 try:
-                    results = _fetch_engine(dd, ek, headers, active_proxy)
+                    results = _fetch_engine(dd, ek, query, amount, headers, active_proxy)
                     results = dd._filter_blacklisted(results)
                 except Exception as exc_engine:
                     if search_all:
@@ -325,7 +327,7 @@ def search():
 def breach():
     """
     SSE stream for breach intel scan.
-    Params: q, engine, amount, proxy
+    Params: q, engine, amount, proxy. engine='__all__' scans every engine.
     """
     target     = request.args.get('q', '').strip()
     engine_key = request.args.get('engine', 'ahmia').lower()
@@ -340,32 +342,54 @@ def breach():
         return Response(stream_with_context(err_stream('No target provided.')),
                         mimetype='text/event-stream')
 
-    if engine_key == '__all__':
-        return Response(stream_with_context(err_stream(
-                        'Breach mode requires a single engine — pick one from the list.')),
-                        mimetype='text/event-stream')
+    search_all = engine_key == '__all__'
 
-    if engine_key not in Configuration.SEARCH_ENGINES:
+    if not search_all and engine_key not in Configuration.SEARCH_ENGINES:
         return Response(stream_with_context(err_stream(f"Unknown engine '{engine_key}'.")),
                         mimetype='text/event-stream')
 
-    engine = Configuration.SEARCH_ENGINES[engine_key]
-    if engine['tor_required']:
-        use_proxy = True
+    if search_all:
+        engine_list  = list(Configuration.SEARCH_ENGINES.keys())
+        use_proxy    = True   # most engines are Tor-only; clearnet ones also work via Tor
+        proxy_config = _proxy_cfg()
+    else:
+        engine = Configuration.SEARCH_ENGINES[engine_key]
+        if engine['tor_required']:
+            use_proxy = True
+        engine_list  = [engine_key]
+        proxy_config = _proxy_cfg() if use_proxy else {}
 
-    proxy_config = _proxy_cfg() if use_proxy else {}
     result_queue: queue.Queue = queue.Queue()
 
     def run_breach():
         try:
-            if use_proxy:
-                is_tor, tor_ip = _check_tor(proxy_config)
-                if not is_tor:
+            engines_to_run  = list(engine_list)
+            local_proxy     = proxy_config
+            local_use_proxy = use_proxy
+
+            if local_use_proxy:
+                is_tor, tor_ip = _check_tor(local_proxy)
+                if is_tor:
+                    result_queue.put(('tor_ok', {'ip': tor_ip}))
+                elif search_all:
+                    # Keep going with the clearnet-capable engines
+                    engines_to_run = [k for k in engines_to_run
+                                      if not Configuration.SEARCH_ENGINES[k]['tor_required']]
+                    local_proxy, local_use_proxy = {}, False
+                    result_queue.put(('engine', {
+                        'engine': '__tor__', 'name': 'Tor', 'status': 'skipped',
+                        'message': 'Tor is not running — scanning clearnet-capable engines only',
+                    }))
+                    if not engines_to_run:
+                        result_queue.put(('error', {
+                            'message': 'Tor is not running or not reachable on localhost:9050.'
+                        }))
+                        return
+                else:
                     result_queue.put(('error', {
                         'message': 'Tor is not running or not reachable on localhost:9050.'
                     }))
                     return
-                result_queue.put(('tor_ok', {'ip': tor_ip}))
 
             import re as _re
             is_email  = '@' in target and '.' in target.split('@')[-1]
@@ -463,7 +487,7 @@ def breach():
                 'target':   target,
                 'type':     'email' if is_email else 'domain' if is_domain else 'keyword',
                 'queries':  len(queries),
-                'engine':   engine_key,
+                'engine':   'all engines' if search_all else engine_key,
             }))
 
             dd        = Darkdump()
@@ -473,30 +497,34 @@ def breach():
 
             for q_idx, query in enumerate(queries, start=1):
                 result_queue.put(('breach_query', {'idx': q_idx, 'total': len(queries), 'query': query}))
-                try:
-                    results = []
-                    if engine_key == 'ahmia':
-                        results = dd._fetch_ahmia(query, amount, headers,
-                                                   proxy_config if use_proxy else None)
-                    elif engine_key == 'notevil':
-                        results = dd._fetch_notevil(query, amount, headers, proxy_config)
-                    elif engine_key == 'tordex':
-                        results = dd._fetch_tordex(query, amount, headers, proxy_config)
-                    elif engine_key == 'tor66':
-                        results = dd._fetch_tor66(query, amount, headers, proxy_config)
-                    elif engine_key == 'onionland':
-                        results = dd._fetch_onionland(query, amount, headers, proxy_config)
-                    elif engine_key == 'excavator':
-                        results = dd._fetch_excavator(query, amount, headers, proxy_config)
 
-                    results = dd._filter_blacklisted(results)
+                for ek in engines_to_run:
+                    eng_i        = Configuration.SEARCH_ENGINES[ek]
+                    active_proxy = local_proxy if local_use_proxy else None
 
+                    if search_all:
+                        result_queue.put(('engine', {'engine': ek, 'name': eng_i['name'],
+                                                     'status': 'fetching'}))
+
+                    try:
+                        results = _fetch_engine(dd, ek, query, amount, headers, active_proxy)
+                        results = dd._filter_blacklisted(results)
+                    except Exception as e:
+                        if search_all:
+                            result_queue.put(('engine', {'engine': ek, 'name': eng_i['name'],
+                                                         'status': 'error', 'message': str(e)}))
+                            continue
+                        result_queue.put(('error', {'message': f"Query failed: {e}"}))
+                        continue
+
+                    engine_count = 0
                     for result in results:
                         site_url = result.get('site_url', '')
                         if not site_url or site_url in seen_urls:
                             continue
                         seen_urls.add(site_url)
                         total += 1
+                        engine_count += 1
                         title = result.get('title', 'No title available')
                         desc  = result.get('description', 'No description available')
                         result_queue.put(('result', {
@@ -504,14 +532,18 @@ def breach():
                             'title':        title,
                             'description':  desc,
                             'url':          site_url,
+                            'engine':       ek,
+                            'engine_name':  eng_i['name'],
                             'breach_query': query,
                             'severity':     classify(title, desc, site_url),
                             'category':     categorise(title, site_url),
                             'artefacts':    extract_artefacts(title + ' ' + desc),
                             'scrape_data':  None,
                         }))
-                except Exception as e:
-                    result_queue.put(('error', {'message': f"Query failed: {e}"}))
+
+                    if search_all:
+                        result_queue.put(('engine', {'engine': ek, 'name': eng_i['name'],
+                                                     'status': 'ok', 'count': engine_count}))
 
         except Exception as exc:
             result_queue.put(('error', {'message': str(exc)}))
@@ -521,9 +553,12 @@ def breach():
     threading.Thread(target=run_breach, daemon=True).start()
 
     def stream():
+        # 'all' scans every engine for every query, so allow more silence
+        # between events before declaring the scan stalled.
+        idle_timeout = 300 if search_all else 120
         while True:
             try:
-                event, data = result_queue.get(timeout=120)
+                event, data = result_queue.get(timeout=idle_timeout)
                 yield _sse(event, data)
                 if event == 'done':
                     break

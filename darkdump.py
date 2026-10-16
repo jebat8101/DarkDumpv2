@@ -39,6 +39,11 @@ import json
 import socket
 import hashlib
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlsplit, urlunsplit
+import posixpath
+
 from headers.agents import Headers
 from banner.banner import Banner
 
@@ -207,6 +212,10 @@ class Configuration:
     DARKDUMP_REQUESTS_SUCCESS_CODE = 200
     DARKDUMP_PROXY = False
     DARKDUMP_TOR_RUNNING = False
+
+    # --live: probes every result URL before it is printed
+    DARKDUMP_LIVENESS_TIMEOUT = 25   # seconds to wait for a single onion to answer
+    DARKDUMP_LIVENESS_WORKERS = 6    # concurrent probes (each gets its own Tor circuit)
 
     descriptions = []
     urls = []
@@ -460,6 +469,78 @@ class Darkdump(object):
         """Remove any result whose .onion hostname is on Ahmia's blacklist."""
         AhmiaBlacklist.load()
         return [r for r in results if not AhmiaBlacklist.is_banned(r.get('site_url', ''))]
+
+    def _liveness_probe(self, url, headers, proxy_config=None, timeout=None):
+        """
+        Probe one result URL and report whether the host is currently alive.
+
+        A host counts as live when it answers with an HTTP status below 500 —
+        2xx/3xx/4xx all mean the service is up (a 404 is a live server that
+        simply has no page there). Connection failures and timeouts mean the
+        onion is dead. .onion hosts are probed through the Tor proxy whenever
+        one is supplied; clearnet URLs are probed directly.
+
+        Returns (alive: bool, detail: str), where detail is the HTTP status or
+        the exception class name.
+        """
+        timeout  = timeout or Configuration.DARKDUMP_LIVENESS_TIMEOUT
+        is_onion = urlsplit(url).netloc.endswith('.onion')
+        proxies  = proxy_config if (is_onion and proxy_config) else None
+        try:
+            response = requests.get(url, headers=headers, proxies=proxies,
+                                    timeout=timeout, stream=True)
+            with response:
+                if response.status_code < 500:
+                    return True, str(response.status_code)
+                return False, f"HTTP {response.status_code}"
+        except requests.exceptions.RequestException as e:
+            return False, type(e).__name__
+
+    def _filter_live_results(self, results, headers, proxy_config=None,
+                             debug_mode=False):
+        """
+        Probe every result URL concurrently and return only the live ones,
+        preserving the original order. Used by --live. Prints one colored line
+        per probed URL plus a summary.
+        """
+        if not results:
+            return results
+
+        print(f"{Colors.BOLD + Colors.C}[ Liveness check: probing {len(results)} "
+              f"link(s) over Tor ]{Colors.END}")
+
+        statuses = {}
+        with ThreadPoolExecutor(max_workers=min(
+                Configuration.DARKDUMP_LIVENESS_WORKERS, len(results))) as pool:
+            futures = {
+                pool.submit(self._liveness_probe, r['site_url'], headers,
+                            proxy_config): idx
+                for idx, r in enumerate(results)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    alive, detail = future.result()
+                except Exception as e:
+                    alive, detail = False, type(e).__name__
+                statuses[idx] = (alive, detail)
+
+                site_url = results[idx]['site_url']
+                if alive:
+                    print(f"{Colors.BOLD}[+] {Colors.G}LIVE {detail}{Colors.END} "
+                          f"{Colors.P}{site_url}{Colors.END}")
+                else:
+                    print(f"{Colors.BOLD}[x] {Colors.R}DEAD {detail}{Colors.END} "
+                          f"{Colors.P}{site_url}{Colors.END}")
+                    if debug_mode:
+                        print(f"    {Colors.GR}[DEBUG] liveness probe failed: "
+                              f"{detail}{Colors.END}")
+
+        live = [r for idx, r in enumerate(results) if statuses.get(idx, (False, ''))[0]]
+        print(f"{Colors.BOLD}[ Liveness: {len(live)}/{len(results)} live, "
+              f"{len(results) - len(live)} dead — showing live links only ]"
+              f"{Colors.END}\n")
+        return live
 
     def clean_text(self, html_content):
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -1201,9 +1282,705 @@ class Darkdump(object):
                 print(f"{Colors.BOLD + Colors.R}[DEBUG] Exception: {e}{Colors.END}")
             return None
 
+    def _normalize_url(self, url, base=None):
+        """
+        Resolve *url* against *base* and normalize it for crawling:
+        lowercase host, drop the fragment. Returns None when the result
+        is not a usable http(s) URL.
+        """
+        url = (url or '').strip()
+        if not url:
+            return None
+        if base:
+            url = urljoin(base, url)
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return None
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return None
+        path = parsed.path or '/'
+        # urljoin leaves dot segments in absolute URLs; collapse them so the
+        # same page is not fetched twice under different spellings.
+        if '/.' in path:
+            normalized = posixpath.normpath(path)
+            if path.endswith('/') and not normalized.endswith('/'):
+                normalized += '/'
+            if normalized.startswith('//'):
+                normalized = '/' + normalized.lstrip('/')
+            path = normalized
+        return urlunsplit((parsed.scheme, parsed.netloc.lower(), path, parsed.query, ''))
+
+    def _page_filename(self, url, idx):
+        """Build a unique, filesystem-safe .html filename for a crawled URL."""
+        parsed = urlsplit(url)
+        name   = parsed.path.strip('/') or 'index'
+        name   = re.sub(r'\.html?$', '', name, flags=re.IGNORECASE)
+        name   = re.sub(r'[^A-Za-z0-9._-]+', '_', name)[:80].strip('._') or 'index'
+        if parsed.query:
+            name += '_' + re.sub(r'[^A-Za-z0-9._-]+', '_', parsed.query)[:40]
+        return f"{idx:04d}_{name}.html"
+
+    def _parse_sitemap(self, content):
+        """Extract every <loc> URL from a sitemap or sitemapindex document."""
+        return [
+            u.strip() for u in re.findall(r'<loc>\s*(.*?)\s*</loc>', content, re.IGNORECASE | re.DOTALL)
+            if u.strip()
+        ]
+
+    def _classify_url(self, url):
+        """
+        Bucket a URL by page kind, using the path shapes forum software
+        (XenForo and relatives) uses.
+        """
+        parsed   = urlsplit(url)
+        path     = parsed.path.lower()
+        query    = parsed.query.lower()
+        segments = [s for s in path.split('/') if s]
+
+        file_exts = ('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip',
+                     '.rar', '.7z', '.tar', '.gz', '.txt', '.json', '.xml', '.csv',
+                     '.sql', '.db', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
+                     '.ico', '.mp4', '.mp3')
+        if path.endswith(file_exts) or '/attachments/' in path:
+            return 'file'
+        if segments[:1] in (['threads'], ['posts']) or 'threads' in segments or 'threads/' in query:
+            return 'thread'
+        if segments[:1] in (['forums'], ['categories']) or 'forums' in segments or 'forums/' in query:
+            return 'board'
+        if segments[:1] == ['members']:
+            return 'member'
+        if segments[:1] == ['tags']:
+            return 'tag'
+        if any(seg in path for seg in ('/whats-new', '/find-new', '/latest', '/recent',
+                                       '/search', '/login', '/register', '/lost-password',
+                                       '/account', '/conversations', '/alerts', '/help',
+                                       '/misc', '/online', '/news-feed', '/watched', '/goto/')):
+            return 'system'
+        if path in ('', '/') or path.endswith('/index.php'):
+            return 'index'
+        return 'other'
+
+    def _url_section(self, url):
+        """Top-level path segment — the site's first-level section."""
+        segments = [p for p in urlsplit(url).path.split('/') if p]
+        return segments[0] if segments else '/'
+
+    def _rewrite_host(self, url, host, scheme):
+        """Move a URL onto *host* and *scheme*, keeping path and query intact."""
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return url
+        return urlunsplit((scheme, host, parsed.path or '/', parsed.query, ''))
+
+    def crawl_site(self, start_url, depth=3, max_pages=200, delay=2.0,
+                   use_proxy=False, wordlist=None, debug_mode=False,
+                   output_file=None, urls_only=False, url_list=None,
+                   resume=False, rewrite_host=True, max_sitemaps=300):
+        """
+        Crawl one site (clearnet or .onion) starting from *start_url*.
+
+        Modes:
+          * default    — link crawl: sitemap seeds plus breadth-first link
+                         following up to *depth*
+          * urls_only  — inventory only: walk the whole sitemap tree and list
+                         every URL; no pages are downloaded
+          * url_list   — download exactly the URLs from *url_list* (one per
+                         line), for fetching a site in resumable batches
+
+        Reachable HTML pages are saved under dd_crawl_dump/<host>/ together
+        with urls.json (full URL inventory), urls.txt (plain URL list, usable
+        as --url-list input) and state.json (resume bookkeeping). Hosts
+        declared in sitemaps that differ from the crawl host are rewritten
+        onto it unless *rewrite_host* is False. Requests are sequential with
+        a pause of *delay* seconds between them.
+        """
+        raw_url   = start_url
+        start_url = self._normalize_url(raw_url)
+        if not start_url:
+            print(f"{Colors.BOLD + Colors.R}Error: '{raw_url}' is not a valid http(s) URL.{Colors.END}")
+            return False
+        started_at = time.time()
+
+        if urls_only and url_list:
+            print(f"{Colors.BOLD + Colors.R}Error: use either --urls-only or --url-list, not both.{Colors.END}")
+            return False
+
+        depth        = max(0, depth)
+        max_pages    = max(1, max_pages)
+        delay        = max(0.0, delay)
+        max_sitemaps = max(1, max_sitemaps)
+        host         = urlsplit(start_url).netloc
+        scheme       = urlsplit(start_url).scheme
+        is_onion     = host.endswith('.onion')
+
+        if is_onion and not use_proxy:
+            print(f"{Colors.BOLD + Colors.O}Note: {host} is a Tor hidden service. "
+                  f"Enabling the proxy automatically.{Colors.END}")
+        if is_onion:
+            use_proxy = True
+        proxy_config = {
+            'http':  Configuration.__socks5init__,
+            'https': Configuration.__socks5init__,
+        } if use_proxy else {}
+
+        if use_proxy and Platform(True).check_tor_connection(proxy_config) is False:
+            print(f"{Colors.BOLD + Colors.R}Tor is required to crawl {host}. Aborting.{Colors.END}")
+            return False
+
+        probes = []
+        if wordlist:
+            if urls_only or url_list:
+                print(f"{Colors.BOLD + Colors.O}Note: --wordlist is ignored in "
+                      f"--urls-only/--url-list mode.{Colors.END}")
+            elif not os.path.isfile(wordlist):
+                print(f"{Colors.BOLD + Colors.R}Error: wordlist file not found: {wordlist}{Colors.END}")
+                return False
+            else:
+                with open(wordlist, 'r', errors='ignore') as f:
+                    probes = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                if not probes:
+                    print(f"{Colors.BOLD + Colors.O}Wordlist is empty; continuing with link crawling only.{Colors.END}")
+
+        list_urls = None
+        if url_list:
+            if not os.path.isfile(url_list):
+                print(f"{Colors.BOLD + Colors.R}Error: URL list file not found: {url_list}{Colors.END}")
+                return False
+            with open(url_list, 'r', errors='ignore') as f:
+                list_urls = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+            if not list_urls:
+                print(f"{Colors.BOLD + Colors.R}Error: URL list file is empty: {url_list}{Colors.END}")
+                return False
+
+        headers  = {'User-Agent': random.choice(Headers.user_agents)}
+        dump_dir = os.path.join('dd_crawl_dump', self.sanitize_filename(host.replace(':', '_')))
+        os.makedirs(dump_dir, exist_ok=True)
+        index_path = os.path.join(dump_dir, 'urls.json')
+        txt_path   = os.path.join(dump_dir, 'urls.txt')
+        state_path = os.path.join(dump_dir, 'state.json')
+
+        if urls_only:
+            print(f"{Colors.BOLD + Colors.C}[ URL inventory — {host} | sitemaps only, no pages fetched ]{Colors.END}")
+        elif url_list:
+            print(f"{Colors.BOLD + Colors.C}[ Download batch — {host} | max {max_pages} pages | "
+                  f"delay {delay}s ]{Colors.END}")
+        else:
+            print(f"{Colors.BOLD + Colors.C}[ Crawling {host} | depth {depth} | "
+                  f"max {max_pages} pages | delay {delay}s ]{Colors.END}")
+        if probes:
+            print(f"{Colors.BOLD + Colors.C}[ Wordlist: {len(probes)} path(s) from {wordlist} ]{Colors.END}")
+        print(f"{Colors.BOLD + Colors.O}Note: read-only crawl, one request at a time over Tor. "
+              f"Press Ctrl+C to stop early.{Colors.END}\n")
+
+        # ---------------------------------------------------------------- state
+        queue         = deque()
+        queued        = set()
+        visited       = set()
+        inventory     = {}          # url -> entry dict (the whole URL map)
+        mirror_hosts  = set()       # foreign hosts declared by the site's sitemaps
+        sitemaps_seen = []
+        fetched       = 0
+        responded     = 0
+        ok_count      = 0
+        errors        = 0
+        saved_count   = 0
+        rewrite_count = 0
+
+        state_prev = {}
+        next_index = 1
+        state_loaded = False
+        if resume and os.path.isfile(state_path):
+            try:
+                with open(state_path) as f:
+                    prev_state = json.load(f)
+                state_prev = prev_state.get('done', {}) or {}
+                next_index = int(prev_state.get('next_index', 1) or 1)
+                state_loaded = True
+            except Exception as e:
+                print(f"{Colors.BOLD + Colors.O}Could not read {state_path} ({e}); starting fresh.{Colors.END}")
+        done = dict(state_prev)
+        if resume and not state_loaded:
+            # No state yet: continue numbering after any pages saved by earlier runs.
+            try:
+                existing = [int(f.split('_', 1)[0]) for f in os.listdir(dump_dir)
+                            if f[:4].isdigit() and f.endswith('.html')]
+                if existing:
+                    next_index = max(existing) + 1
+                    print(f"{Colors.BOLD + Colors.O}No state file found; continuing page numbering "
+                          f"at {next_index}.{Colors.END}")
+            except Exception:
+                pass
+        if resume and os.path.isfile(index_path):
+            try:
+                with open(index_path) as f:
+                    old_doc = json.load(f)
+                for item in old_doc.get('urls', []) or []:
+                    u = item.get('url')
+                    if not u:
+                        continue
+                    inventory[u] = {
+                        'url': u,
+                        'type': item.get('type') or self._classify_url(u),
+                        'section': item.get('section') or self._url_section(u),
+                        'source': item.get('source', 'sitemap'),
+                        'status': item.get('status'),
+                        'saved_file': item.get('saved_file'),
+                        'blocked': bool(item.get('blocked', False)),
+                    }
+                    if item.get('title'):
+                        inventory[u]['title'] = item['title']
+            except Exception:
+                pass
+
+        def same_site(url):
+            h = urlsplit(url).netloc
+            return h == host or h in mirror_hosts
+
+        def add_url(url, source, base=None):
+            """Normalize, host-check/rewrite and record a URL. Returns it or None."""
+            nonlocal rewrite_count
+            norm = self._normalize_url(url, base=base or start_url)
+            if not norm:
+                return None
+            url_host = urlsplit(norm).netloc
+            if source != 'list' and url_host != host:
+                if source == 'sitemap' or url_host in mirror_hosts:
+                    mirror_hosts.add(url_host)
+                    if rewrite_host:
+                        norm = self._rewrite_host(norm, host, scheme)
+                        rewrite_count += 1
+                else:
+                    return None     # external link — not part of this site
+            entry = inventory.get(norm)
+            if entry is None:
+                inventory[norm] = {
+                    'url': norm,
+                    'type': self._classify_url(norm),
+                    'section': self._url_section(norm),
+                    'source': source,
+                    'status': None,
+                    'saved_file': None,
+                    'blocked': False,
+                }
+            return norm
+
+        def fetch_page(url):
+            try:
+                return requests.get(url, headers=headers, proxies=proxy_config, timeout=30), None
+            except Exception as e:
+                return None, str(e)[:120]
+
+        def save_page(url, response):
+            nonlocal next_index, saved_count
+            filename = self._page_filename(url, next_index)
+            with open(os.path.join(dump_dir, filename), 'wb') as f:
+                f.write(response.content)
+            next_index += 1
+            saved_count += 1
+            return os.path.join(dump_dir, filename)
+
+        def save_state():
+            try:
+                state_doc = {
+                    'target':     start_url,
+                    'host':       host,
+                    'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'next_index': next_index,
+                    'done':       done,
+                }
+                with open(state_path, 'w') as f:
+                    json.dump(state_doc, f, indent=2)
+            except Exception:
+                pass
+
+        def process_response(url, response, level=0, is_probe=False, quiet_404=False):
+            """Record a fetched page: save HTML, classify, update inventory."""
+            nonlocal fetched, responded, ok_count
+            fetched   += 1
+            responded += 1
+            status = response.status_code
+            ctype  = response.headers.get('Content-Type', '')
+            is_html = ('html' in ctype.lower()
+                       or (not ctype.strip() and b'<' in response.content[:512]))
+            title      = ''
+            saved_file = None
+            soup       = None
+            if is_html and response.content:
+                soup  = BeautifulSoup(response.content, 'html.parser')
+                title = (soup.title.get_text(strip=True) if soup.title else '')[:150]
+
+            blocked = status in (401, 403)
+            if (status == 200 and response.url and '/login/' in response.url
+                    and '/login/' not in url):
+                blocked = True      # bounced to the login wall
+
+            if status == 200 and is_html and response.content:
+                ok_count  += 1
+                saved_file = save_page(url, response)
+
+            entry = inventory.get(url)
+            if entry is None:
+                entry = inventory[url] = {
+                    'url': url, 'type': self._classify_url(url),
+                    'section': self._url_section(url),
+                    'source': 'list' if url_list else 'link',
+                    'status': None, 'saved_file': None, 'blocked': False,
+                }
+            entry.update({
+                'status': status, 'saved_file': saved_file, 'blocked': blocked,
+                'title': title, 'size': len(response.content), 'depth': level,
+            })
+            if is_probe:
+                entry['probe'] = True
+            if response.url and response.url != url:
+                entry['redirected_to'] = response.url
+
+            # Resume bookkeeping: an answered URL is done unless it may succeed
+            # later (server errors, throttling). Blocked pages count as done.
+            if status < 500 and status != 429:
+                done[url] = {'status': status, 'saved_file': saved_file}
+                if len(done) % 5 == 0:
+                    save_state()
+
+            if not (status == 404 and quiet_404):
+                color  = Colors.G if status == 200 else Colors.O
+                marker = '[probe]' if is_probe else ('[+]' if status == 200 else '[!]')
+                tag    = f" {Colors.GR}{title}{Colors.END}" if title else ''
+                wall   = f" {Colors.R}(login wall){Colors.END}" if blocked else ''
+                print(f"{Colors.BOLD}{marker} {color}{status}{Colors.END} {Colors.P}{url}{Colors.END}{tag}{wall}")
+            return soup
+
+        def mark_redirect(response, url):
+            """Track a redirect's final URL so it is not fetched a second time."""
+            if response.url and response.url != url:
+                final = add_url(response.url, source='link')
+                if final and same_site(final):
+                    queued.discard(final)
+                    visited.add(final)
+
+        sitemap_count   = 0
+        sitemap_cap_hit = False
+
+        def load_sitemap(sitemap_url):
+            nonlocal sitemap_count, sitemap_cap_hit
+            sm_url = self._normalize_url(sitemap_url, base=start_url)
+            if not sm_url or sm_url in queued:
+                return
+            if sitemap_count >= max_sitemaps:
+                if not sitemap_cap_hit:
+                    sitemap_cap_hit = True
+                    print(f"{Colors.BOLD + Colors.O}Reached the sitemap limit "
+                          f"({max_sitemaps}); ignoring further sitemap links.{Colors.END}")
+                return
+            sm_host = urlsplit(sm_url).netloc
+            if sm_host != host:
+                mirror_hosts.add(sm_host)
+            queued.add(sm_url)
+            sitemap_count += 1
+            try:
+                response = requests.get(sm_url, headers=headers, proxies=proxy_config, timeout=30)
+                time.sleep(delay)
+            except Exception as e:
+                if debug_mode:
+                    print(f"{Colors.BOLD + Colors.R}[DEBUG] sitemap fetch failed: {sm_url} — {e}{Colors.END}")
+                return
+            if response.status_code != 200:
+                return
+            sitemaps_seen.append(sm_url)
+            print(f"{Colors.BOLD}[+] {Colors.G}200{Colors.END} {Colors.P}{sm_url}{Colors.END} (sitemap)")
+            for loc in self._parse_sitemap(response.text):
+                if urlsplit(loc).path.endswith('.xml'):
+                    if urlsplit(loc).netloc and urlsplit(loc).netloc != host and rewrite_host:
+                        loc = self._rewrite_host(loc, host, scheme)
+                    load_sitemap(loc)
+                else:
+                    add_url(loc, source='sitemap')
+
+        def enqueue(url, d, base=None):
+            if d > depth:
+                return
+            norm = add_url(url, source='link', base=base)
+            if norm and same_site(norm) and norm not in queued:
+                queued.add(norm)
+                queue.append((norm, d))
+
+        try:
+            # Seed: robots.txt (+ any Sitemap: lines it declares) and /sitemap.xml
+            robots_url = self._normalize_url('/robots.txt', base=start_url)
+            try:
+                robots = requests.get(robots_url, headers=headers, proxies=proxy_config, timeout=30)
+                time.sleep(delay)
+            except Exception:
+                robots = None
+            if robots is not None and robots.status_code == 200:
+                print(f"{Colors.BOLD}[+] {Colors.G}200{Colors.END} {Colors.P}{robots_url}{Colors.END} (robots.txt)")
+                for line in robots.text.splitlines():
+                    if line.strip().lower().startswith('sitemap:'):
+                        load_sitemap(line.split(':', 1)[1].strip())
+            load_sitemap('/sitemap.xml')
+            load_sitemap('/sitemap.php')       # XenForo-style index, harmless if absent
+
+            if inventory:
+                print(f"{Colors.BOLD}| Sitemap seeds: {Colors.END}{Colors.G}{len(inventory)} URL(s) discovered{Colors.END}")
+
+            if urls_only:
+                pass        # inventory done — nothing to download by design
+            elif url_list:
+                # Download batch: fetch exactly the listed URLs, in order.
+                list_normed = []
+                for u in list_urls:
+                    norm = add_url(u, source='list')
+                    if norm and norm not in list_normed:
+                        list_normed.append(norm)
+                total     = len(list_normed)
+                remaining = [u for u in list_normed if u not in done]
+                already   = total - len(remaining)
+                if state_loaded or already:
+                    print(f"{Colors.BOLD}| Resuming: {Colors.END}{Colors.G}{already}{Colors.END} of "
+                          f"{total} URL(s) already done, {Colors.G}{len(remaining)}{Colors.END} remaining.{Colors.END}")
+                if not remaining:
+                    print(f"{Colors.BOLD + Colors.G}All {total} URLs are already downloaded.{Colors.END}")
+                for url in remaining:
+                    if fetched >= max_pages:
+                        print(f"{Colors.BOLD + Colors.O}Batch limit reached ({max_pages} pages); "
+                              f"run again with --resume to continue.{Colors.END}")
+                        break
+                    response, error = fetch_page(url)
+                    if error:
+                        errors += 1
+                        entry = inventory.setdefault(url, {
+                            'url': url, 'type': self._classify_url(url),
+                            'section': self._url_section(url), 'source': 'list',
+                            'status': None, 'saved_file': None, 'blocked': False,
+                        })
+                        entry['status'] = 'ERR'
+                        entry['error']  = error
+                        print(f"{Colors.BOLD}[x] {Colors.R}ERR{Colors.END} {Colors.P}{url}{Colors.END}")
+                        if debug_mode:
+                            print(f"{Colors.BOLD + Colors.R}[DEBUG] {error}{Colors.END}")
+                        time.sleep(delay)
+                        continue
+                    soup = process_response(url, response)
+                    mark_redirect(response, url)
+                    if soup:
+                        for href in self.extract_links(soup):
+                            add_url(href, source='link', base=url)
+                    time.sleep(delay)
+            else:
+                enqueue(start_url, 0)
+
+                # Optional wordlist probes: guessed paths that may not be linked
+                if probes:
+                    base  = start_url if start_url.endswith('/') else start_url + '/'
+                    found = 0
+                    print(f"\n{Colors.BOLD + Colors.C}[ Probing wordlist paths ]{Colors.END}")
+                    for word in probes:
+                        if fetched >= max_pages:
+                            print(f"{Colors.BOLD + Colors.O}Reached max-pages limit ({max_pages}); "
+                                  f"stopping probes.{Colors.END}")
+                            break
+                        probe_url = self._normalize_url(word, base=base)
+                        if not probe_url or urlsplit(probe_url).netloc != host:
+                            continue
+                        if probe_url in visited or probe_url in queued or probe_url in done:
+                            continue
+                        visited.add(probe_url)
+                        add_url(probe_url, source='link')
+                        response, error = fetch_page(probe_url)
+                        if error:
+                            errors += 1
+                            entry = inventory.setdefault(probe_url, {
+                                'url': probe_url, 'type': self._classify_url(probe_url),
+                                'section': self._url_section(probe_url), 'source': 'link',
+                                'status': None, 'saved_file': None, 'blocked': False,
+                            })
+                            entry['status'] = 'ERR'
+                            entry['error']  = error
+                            print(f"{Colors.BOLD}[x] {Colors.R}ERR{Colors.END} {Colors.P}{probe_url}{Colors.END}")
+                            if debug_mode:
+                                print(f"{Colors.BOLD + Colors.R}[DEBUG] probe error {probe_url}: {error}{Colors.END}")
+                            time.sleep(delay)
+                            continue
+                        soup = process_response(probe_url, response, is_probe=True,
+                                                quiet_404=not debug_mode)
+                        mark_redirect(response, probe_url)
+                        if response.status_code == 200:
+                            found += 1
+                            if soup and depth >= 1:
+                                for href in self.extract_links(soup):
+                                    enqueue(href, 1, base=probe_url)
+                        time.sleep(delay)
+                    print(f"{Colors.BOLD}| Probe hits (200): {Colors.END}{Colors.G}{found}{Colors.END}\n")
+
+                # Breadth-first link crawl
+                while queue and fetched < max_pages:
+                    url, d = queue.popleft()
+                    if url in visited or url in done:
+                        continue
+                    visited.add(url)
+                    response, error = fetch_page(url)
+                    if error:
+                        errors += 1
+                        entry = inventory.setdefault(url, {
+                            'url': url, 'type': self._classify_url(url),
+                            'section': self._url_section(url), 'source': 'link',
+                            'status': None, 'saved_file': None, 'blocked': False,
+                        })
+                        entry['status'] = 'ERR'
+                        entry['error']  = error
+                        print(f"{Colors.BOLD}[x] {Colors.R}ERR{Colors.END} {Colors.P}{url}{Colors.END}")
+                        if debug_mode:
+                            print(f"{Colors.BOLD + Colors.R}[DEBUG] {error}{Colors.END}")
+                        time.sleep(delay)
+                        continue
+                    soup = process_response(url, response, level=d)
+                    mark_redirect(response, url)
+                    if soup and d < depth:
+                        for href in self.extract_links(soup):
+                            enqueue(href, d + 1, base=url)
+                    time.sleep(delay)
+
+        except KeyboardInterrupt:
+            print(f"\n{Colors.BOLD + Colors.R}Interrupted — saving progress so far.{Colors.END}")
+
+        # ------------------------------------------------------------- outputs
+        counts_by_type    = {}
+        counts_by_section = {}
+        for entry in inventory.values():
+            counts_by_type[entry['type']] = counts_by_type.get(entry['type'], 0) + 1
+            counts_by_section[entry['section']] = counts_by_section.get(entry['section'], 0) + 1
+
+        inventory_doc = {
+            'target':            start_url,
+            'host':              host,
+            'updated_at':        time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'sitemaps':          sitemaps_seen,
+            'mirror_hosts':      sorted(mirror_hosts),
+            'counts_by_type':    counts_by_type,
+            'counts_by_section': counts_by_section,
+            'stats': {
+                'requests':      fetched,
+                'reachable':     ok_count,
+                'errors':        errors,
+                'saved_files':   saved_count,
+                'sitemaps':      len(sitemaps_seen),
+                'rewritten':     rewrite_count,
+            },
+            'urls': sorted(inventory.values(), key=lambda e: e['url']),
+        }
+        try:
+            with open(index_path, 'w') as f:
+                json.dump(inventory_doc, f, indent=2)
+        except Exception as e:
+            print(f"{Colors.BOLD + Colors.R}Could not write {index_path}: {e}{Colors.END}")
+        try:
+            with open(txt_path, 'w') as f:
+                for u in sorted(inventory):
+                    f.write(u + '\n')
+        except Exception as e:
+            print(f"{Colors.BOLD + Colors.R}Could not write {txt_path}: {e}{Colors.END}")
+        if resume or url_list or fetched > 0:
+            save_state()
+
+        if output_file:
+            try:
+                if output_file.lower().endswith('.json'):
+                    with open(output_file, 'w') as f:
+                        json.dump(inventory_doc, f, indent=2)
+                elif output_file.lower().endswith('.csv'):
+                    import csv as _csv
+                    with open(output_file, 'w', newline='') as f:
+                        writer = _csv.DictWriter(
+                            f, fieldnames=['url', 'type', 'section', 'status', 'saved_file', 'title'],
+                            extrasaction='ignore')
+                        writer.writeheader()
+                        for entry in sorted(inventory.values(), key=lambda e: e['url']):
+                            writer.writerow({k: entry.get(k, '') for k in writer.fieldnames})
+                else:
+                    with open(output_file, 'w') as f:
+                        if urls_only:
+                            for u in sorted(inventory):
+                                f.write(u + '\n')
+                        else:
+                            f.write(f"# Crawl of {start_url} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            for entry in sorted(inventory.values(), key=lambda e: e['url']):
+                                if entry.get('status') is None and entry.get('saved_file') is None:
+                                    continue
+                                line = f"{entry.get('status')}\t{entry['url']}"
+                                if entry.get('title'):
+                                    line += f"\t{entry['title']}"
+                                f.write(line + '\n')
+                print(f"{Colors.BOLD + Colors.G}Output also saved to: {output_file}{Colors.END}")
+            except Exception as e:
+                print(f"{Colors.BOLD + Colors.R}Could not write output file {output_file}: {e}{Colors.END}")
+
+        print('-' * 50)
+
+        if urls_only:
+            est_hours = len(inventory) * (delay + 3.5) / 3600.0
+            print(f"{Colors.BOLD}[ URL inventory — {host} ]{Colors.END}")
+            print(f"{Colors.BOLD}| Sitemap files fetched: {Colors.END}{Colors.G}{len(sitemaps_seen)}{Colors.END}")
+            print(f"{Colors.BOLD}| URLs found: {Colors.END}{Colors.G}{len(inventory)}{Colors.END}")
+            for t, n in sorted(counts_by_type.items(), key=lambda kv: -kv[1]):
+                print(f"{Colors.BOLD}|   {t}: {Colors.END}{Colors.G}{n}{Colors.END}")
+            top = ', '.join(f"{s} ({n})" for s, n in
+                            sorted(counts_by_section.items(), key=lambda kv: -kv[1])[:12])
+            print(f"{Colors.BOLD}| Top sections: {Colors.END}{Colors.G}{top}{Colors.END}")
+            if mirror_hosts:
+                action = 'rewrote' if rewrite_host else 'kept on'
+                print(f"{Colors.BOLD}| Mirror hosts: {Colors.END}{Colors.G}{', '.join(sorted(mirror_hosts))}"
+                      f" ({action} {rewrite_count} URL(s)){Colors.END}")
+            print(f"{Colors.BOLD}| urls.txt: {Colors.END}{Colors.G}{os.path.abspath(txt_path)}{Colors.END}")
+            print(f"{Colors.BOLD}| urls.json: {Colors.END}{Colors.G}{os.path.abspath(index_path)}{Colors.END}")
+            if len(inventory):
+                print(f"\n{Colors.BOLD}Download everything in batches (estimated ~{est_hours:.1f} h total over Tor):{Colors.END}")
+                print(f"  darkdump-cli --crawl {start_url} --url-list {txt_path} --max-pages 500 --delay {delay:g} --resume")
+        elif url_list:
+            remaining = sum(1 for u in inventory if u not in done and inventory[u].get('status') is None)
+            progress  = (len(done) / len(inventory) * 100.0) if inventory else 0.0
+            rate      = ((time.time() - started_at) / fetched) if fetched else (delay + 3.5)
+            est_batch = min(remaining, 500) * rate / 60.0 if remaining else 0.0
+            print(f"{Colors.BOLD}[ Batch summary — {host} ]{Colors.END}")
+            print(f"{Colors.BOLD}| Fetched this run: {Colors.END}{Colors.G}{fetched}{Colors.END}"
+                  f"  {Colors.BOLD}| Saved: {Colors.END}{Colors.G}{saved_count}{Colors.END}"
+                  f"  {Colors.BOLD}| Errors: {Colors.END}{Colors.G}{errors}{Colors.END}")
+            print(f"{Colors.BOLD}| Inventory: {Colors.END}{Colors.G}{len(inventory)}{Colors.END} URL(s), "
+                  f"{Colors.G}{len(done)}{Colors.END} done ({progress:.2f}%), "
+                  f"{Colors.G}{remaining}{Colors.END} remaining")
+            if fetched:
+                print(f"{Colors.BOLD}| Observed rate: {Colors.END}{Colors.G}{rate:.1f}s per page{Colors.END} "
+                      f"(Tor latency varies)")
+            print(f"{Colors.BOLD}| urls.txt: {Colors.END}{Colors.G}{os.path.abspath(txt_path)}{Colors.END}")
+            print(f"{Colors.BOLD}| urls.json: {Colors.END}{Colors.G}{os.path.abspath(index_path)}{Colors.END}")
+            if remaining:
+                print(f"\n{Colors.BOLD}Continue ({remaining} left; a 500-page batch takes "
+                      f"~{est_batch:.0f} min at this rate):{Colors.END}")
+                print(f"  darkdump-cli --crawl {start_url} --url-list {txt_path} --max-pages 500 --delay {delay:g} --resume")
+            else:
+                print(f"{Colors.BOLD + Colors.G}All inventory URLs have been downloaded.{Colors.END}")
+        else:
+            print(f"{Colors.BOLD}[ Crawl summary — {host} ]{Colors.END}")
+            print(f"{Colors.BOLD}| Requests sent: {Colors.END}{Colors.G}{fetched}{Colors.END}")
+            print(f"{Colors.BOLD}| Reachable pages: {Colors.END}{Colors.G}{ok_count}{Colors.END}")
+            print(f"{Colors.BOLD}| Pages saved: {Colors.END}{Colors.G}{saved_count}{Colors.END}")
+            print(f"{Colors.BOLD}| Errors: {Colors.END}{Colors.G}{errors}{Colors.END}")
+            print(f"{Colors.BOLD}| URLs discovered: {Colors.END}{Colors.G}{len(inventory)}{Colors.END}")
+            print(f"{Colors.BOLD}| URL index: {Colors.END}{Colors.G}{os.path.abspath(index_path)}{Colors.END}")
+            print(f"{Colors.BOLD}| Dump folder: {Colors.END}{Colors.G}{os.path.abspath(dump_dir)}{Colors.END}")
+        if mirror_hosts and not urls_only:
+            action = 'rewrote' if rewrite_host else 'kept on'
+            print(f"{Colors.BOLD}| Mirror hosts: {Colors.END}{Colors.G}{', '.join(sorted(mirror_hosts))}"
+                  f" ({action} {rewrite_count} URL(s)){Colors.END}")
+        if responded == 0 and not urls_only:
+            print(f"{Colors.BOLD + Colors.R}No page responded — the site may be down, "
+                  f"or Tor could not reach it.{Colors.END}")
+        return True if urls_only else responded > 0
+
     def crawl(self, query, amount, engine_key='ahmia', use_proxy=False,
               scrape_sites=False, scrape_images=False, debug_mode=False,
-              output_file=None, dedupe=False):
+              output_file=None, dedupe=False, live_check=False):
 
         engine_key = engine_key.lower()
         search_all = engine_key == 'all'
@@ -1235,6 +2012,19 @@ class Darkdump(object):
                     f"{Colors.BOLD + Colors.O}Warning: {engine['name']} is a Tor-only search engine. "
                     f"Enabling proxy automatically.{Colors.END}"
                 )
+            proxy_config = {
+                'http':  Configuration.__socks5init__,
+                'https': Configuration.__socks5init__,
+            }
+            use_proxy = True
+
+        # --live probes every result link over Tor, so the proxy is needed even
+        # for engines whose search page works over clearnet.
+        if live_check and not use_proxy:
+            print(
+                f"{Colors.BOLD + Colors.O}Note: '--live' probes every result link "
+                f"over Tor. Enabling the proxy automatically.{Colors.END}"
+            )
             proxy_config = {
                 'http':  Configuration.__socks5init__,
                 'https': Configuration.__socks5init__,
@@ -1302,6 +2092,12 @@ class Darkdump(object):
                     f"{Colors.BOLD + Colors.O}Continuing without Tor — "
                     f"Tor-only engines will be skipped.{Colors.END}\n"
                 )
+                if live_check:
+                    print(
+                        f"{Colors.BOLD + Colors.O}Liveness check disabled — "
+                        f"probing onions requires Tor.{Colors.END}\n"
+                    )
+                    live_check = False
 
         if not search_all:
             print(f"{Colors.BOLD + Colors.C}[ Engine: {engine['name']} ]{Colors.END}\n")
@@ -1356,6 +2152,15 @@ class Darkdump(object):
         if not results:
             print(f"{Colors.BOLD + Colors.O}No results returned from {engine_label}.{Colors.END}")
             return
+
+        # --live: probe every result link and keep only the ones that respond.
+        if live_check:
+            results = self._filter_live_results(results, headers, proxy_config,
+                                                debug_mode)
+            if not results:
+                print(f"{Colors.BOLD + Colors.O}No live links among the results "
+                      f"from {engine_label}.{Colors.END}")
+                return
 
         saver      = ResultSaver(output_file, query=query, engine=engine_key) if output_file else None
         seen_urls  = set()
@@ -1419,7 +2224,7 @@ class Darkdump(object):
     def breach_intel(self, target: str, amount: int = 10, engine_key: str = 'ahmia',
                      use_proxy: bool = False, debug_mode: bool = False,
                      output_file: str = None, deep_scrape: bool = False,
-                     query_delay: float = 1.5):
+                     query_delay: float = 1.5, live_check: bool = False):
         """
         Advanced breach and credential leak intelligence scan.
 
@@ -1441,12 +2246,18 @@ class Darkdump(object):
                                     rate-limits (default 1.5 s).
         - Structured output       : saves a richer JSON/CSV/TXT report that
                                     includes severity, artefacts, and categories.
+        - All-engine mode         : with -e all every generated query runs against
+                                    every configured engine. Each hit is tagged with
+                                    its source engine, failing engines are skipped,
+                                    and when Tor is down the Tor-only engines are
+                                    dropped instead of aborting the scan.
 
         Usage
         -----
         python3 darkdump.py --breach -q "example.com" -e ahmia
         python3 darkdump.py --breach -q "admin@corp.com" -e notevil -p --breach-deep
         python3 darkdump.py --breach -q "john_doe" -e tor66 -o report.json
+        python3 darkdump.py --breach -q "example.com" -e all
         """
         import time as _time
         import hashlib as _hashlib
@@ -1618,33 +2429,88 @@ class Darkdump(object):
             'INFO':     Colors.GR,
         }
 
-        if engine_key.lower() == 'all':
-            print(f"{Colors.BOLD + Colors.R}Breach mode requires a single engine — 'all' is not supported here.{Colors.END}")
+        engine_key = engine_key.lower()
+        search_all = engine_key == 'all'
+
+        if not search_all and engine_key not in Configuration.SEARCH_ENGINES:
+            print(f"{Colors.BOLD + Colors.R}Unknown engine '{engine_key}'. "
+                  f"Valid options: {', '.join(Configuration.VALID_ENGINES)}, all{Colors.END}")
             return
 
-        engine = Configuration.SEARCH_ENGINES[engine_key]
+        if search_all:
+            engine_keys  = list(Configuration.SEARCH_ENGINES)
+            engine_label = 'all engines'
+        else:
+            engine_keys  = [engine_key]
+            engine_label = Configuration.SEARCH_ENGINES[engine_key]['name']
+
+        engine = Configuration.SEARCH_ENGINES[engine_key] if not search_all else None
+
         proxy_config = {
             'http':  Configuration.__socks5init__,
             'https': Configuration.__socks5init__,
         } if use_proxy else {}
 
-        if engine['tor_required'] and not use_proxy:
+        # Tor-only engines: auto-enable proxy if the user forgot -p ('all'
+        # includes Tor-only engines, so it enables the proxy too)
+        if (search_all or engine['tor_required']) and not use_proxy:
+            if search_all:
+                print(
+                    f"{Colors.BOLD + Colors.O}Note: 'all' queries every configured engine, "
+                    f"including Tor-only ones. Enabling the proxy automatically.{Colors.END}"
+                )
+            else:
+                print(f"{Colors.BOLD + Colors.O}Tor proxy enabled automatically for {engine['name']}.{Colors.END}")
             proxy_config = {
                 'http':  Configuration.__socks5init__,
                 'https': Configuration.__socks5init__,
             }
             use_proxy = True
-            print(f"{Colors.BOLD + Colors.O}Tor proxy enabled automatically for {engine['name']}.{Colors.END}")
+
+        # --live probes every result link over Tor, even for clearnet engines.
+        if live_check and not use_proxy:
+            proxy_config = {
+                'http':  Configuration.__socks5init__,
+                'https': Configuration.__socks5init__,
+            }
+            use_proxy = True
+            print(f"{Colors.BOLD + Colors.O}Note: '--live' probes every result link "
+                  f"over Tor. Enabling the proxy automatically.{Colors.END}")
 
         if use_proxy:
             if Platform(True).check_tor_connection(proxy_config) is False:
-                return
+                if not search_all:
+                    return
+                # Tor is down: keep going with the clearnet-capable engines
+                engine_keys  = [k for k in engine_keys
+                                if not Configuration.SEARCH_ENGINES[k]['tor_required']]
+                proxy_config = {}
+                use_proxy    = False
+                if not engine_keys:
+                    print(f"{Colors.BOLD + Colors.R}No engines left to query without Tor.{Colors.END}")
+                    return
+                print(
+                    f"{Colors.BOLD + Colors.O}Continuing without Tor — "
+                    f"Tor-only engines will be skipped.{Colors.END}\n"
+                )
+                if live_check:
+                    print(
+                        f"{Colors.BOLD + Colors.O}Liveness check disabled — "
+                        f"probing onions requires Tor.{Colors.END}\n"
+                    )
+                    live_check = False
 
+        engine_line = (
+            f"{Colors.BOLD}Engines    : {Colors.END}"
+            f"{', '.join(Configuration.SEARCH_ENGINES[k]['name'] for k in engine_keys)}\n"
+            if search_all else ''
+        )
         print(
             f"\n{Colors.BOLD + Colors.C}[ Breach Intel Scan ]{Colors.END}\n"
             f"{Colors.BOLD}Target     : {Colors.END}{Colors.P}{target}{Colors.END}\n"
             f"{Colors.BOLD}Type       : {Colors.END}{target_type}\n"
-            f"{Colors.BOLD}Engine     : {Colors.END}{engine_key}\n"
+            f"{Colors.BOLD}Engine     : {Colors.END}{engine_label}\n"
+            + engine_line +
             f"{Colors.BOLD}Queries    : {Colors.END}{len(queries)}\n"
             f"{Colors.BOLD}Deep scrape: {Colors.END}{'on' if deep_scrape else 'off'}\n"
             f"{Colors.BOLD}Query delay: {Colors.END}{query_delay}s\n"
@@ -1653,107 +2519,139 @@ class Darkdump(object):
         all_results = []
         seen_urls   = set()
         dd          = Darkdump()
+        interrupted = False
 
+        # Run every query against every selected engine. In 'all' mode a failing
+        # engine is reported and skipped instead of aborting the whole scan.
         for q_idx, query in enumerate(queries, start=1):
             print(f"{Colors.BOLD + Colors.C}[{q_idx}/{len(queries)}]{Colors.END} {query}")
 
-            try:
-                headers = {'User-Agent': random.choice(Headers.user_agents)}
-                results = []
+            for ek in engine_keys:
+                eng          = Configuration.SEARCH_ENGINES[ek]
+                active_proxy = proxy_config if use_proxy else None
 
-                if engine_key == 'ahmia':
-                    results = dd._fetch_ahmia(query, amount, headers,
-                                              proxy_config if use_proxy else None)
-                elif engine_key == 'notevil':
-                    results = dd._fetch_notevil(query, amount, headers, proxy_config)
-                elif engine_key == 'tordex':
-                    results = dd._fetch_tordex(query, amount, headers, proxy_config)
-                elif engine_key == 'tor66':
-                    results = dd._fetch_tor66(query, amount, headers, proxy_config)
-                elif engine_key == 'onionland':
-                    results = dd._fetch_onionland(query, amount, headers, proxy_config)
-                elif engine_key == 'excavator':
-                    results = dd._fetch_excavator(query, amount, headers, proxy_config)
-                elif engine_key == 'torch':
-                    results = dd._fetch_torch(query, amount, headers, proxy_config)
-                elif engine_key == 'darksearch':
-                    results = dd._fetch_darksearch(query, amount, headers, proxy_config)
-                elif engine_key == 'vormweb':
-                    results = dd._fetch_vormweb(query, amount, headers, proxy_config)
+                if search_all:
+                    print(f"  {Colors.BOLD + Colors.GR}[{eng['name']}]{Colors.END}")
 
-                results = dd._filter_blacklisted(results)
+                try:
+                    headers = {'User-Agent': random.choice(Headers.user_agents)}
+                    results = []
 
-                new_count = 0
-                for result in results:
-                    site_url    = result.get('site_url', '')
-                    title       = result.get('title', 'No title available')
-                    description = result.get('description', 'No description available')
+                    if ek == 'ahmia':
+                        results = dd._fetch_ahmia(query, amount, headers, active_proxy)
+                    elif ek == 'notevil':
+                        results = dd._fetch_notevil(query, amount, headers, active_proxy or {})
+                    elif ek == 'tordex':
+                        results = dd._fetch_tordex(query, amount, headers, active_proxy or {})
+                    elif ek == 'tor66':
+                        results = dd._fetch_tor66(query, amount, headers, active_proxy or {})
+                    elif ek == 'onionland':
+                        results = dd._fetch_onionland(query, amount, headers, active_proxy or {})
+                    elif ek == 'excavator':
+                        results = dd._fetch_excavator(query, amount, headers, active_proxy or {})
+                    elif ek == 'torch':
+                        results = dd._fetch_torch(query, amount, headers, active_proxy or {})
+                    elif ek == 'darksearch':
+                        results = dd._fetch_darksearch(query, amount, headers, active_proxy or {})
+                    elif ek == 'vormweb':
+                        results = dd._fetch_vormweb(query, amount, headers, active_proxy or {})
 
-                    if not site_url or site_url in seen_urls:
-                        continue
-                    seen_urls.add(site_url)
-                    new_count += 1
+                    results = dd._filter_blacklisted(results)
 
-                    # ── Analysis ───────────────────────────────────────────
-                    severity   = classify_severity(title, description, site_url)
-                    category   = classify_category(title, site_url)
-                    artefacts  = extract_artefacts(title + ' ' + description)
-                    scrape_data = None
+                    # --live: probe the fresh URLs of this query's results; dead
+                    # onions are dropped before severity analysis.
+                    if live_check:
+                        fresh, fresh_seen = [], set()
+                        for result in results:
+                            u = result.get('site_url', '')
+                            if u and u not in seen_urls and u not in fresh_seen:
+                                fresh_seen.add(u)
+                                fresh.append(result)
+                        results = dd._filter_live_results(fresh, headers, proxy_config,
+                                                          debug_mode)
 
-                    # ── Deep scrape ─────────────────────────────────────────
-                    if deep_scrape:
-                        try:
-                            scrape_data = dd._scrape_site(
-                                site_url, headers, proxy_config,
-                                scrape_images=False, debug_mode=debug_mode,
-                                idx=len(all_results) + 1
-                            )
-                            # Enrich artefacts from scraped page text
-                            if scrape_data:
-                                page_emails = scrape_data.get('emails', [])
-                                if page_emails:
-                                    artefacts.setdefault('emails', [])
-                                    artefacts['emails'] = list(
-                                        dict.fromkeys(artefacts['emails'] + page_emails)
-                                    )[:20]
-                        except Exception as e:
-                            if debug_mode:
-                                print(f"    {Colors.O}[scrape error] {e}{Colors.END}")
+                    new_count = 0
+                    for result in results:
+                        site_url    = result.get('site_url', '')
+                        title       = result.get('title', 'No title available')
+                        description = result.get('description', 'No description available')
 
-                    enriched = {
-                        'title':       title,
-                        'description': description,
-                        'site_url':    site_url,
-                        'breach_query': query,
-                        'severity':    severity,
-                        'category':    category,
-                        'artefacts':   artefacts,
-                        'scrape_data': scrape_data,
-                    }
-                    all_results.append(enriched)
+                        if not site_url or site_url in seen_urls:
+                            continue
+                        seen_urls.add(site_url)
+                        new_count += 1
 
-                    sev_col = SEVERITY_COLOR.get(severity, Colors.GR)
-                    print(
-                        f"  {sev_col}[{severity}]{Colors.END} "
-                        f"{Colors.P}{title}{Colors.END}\n"
-                        f"  {Colors.GR}{site_url}{Colors.END}\n"
-                        f"  {Colors.GR}category={category}{Colors.END}"
-                    )
-                    if artefacts:
-                        for k, v in artefacts.items():
-                            print(f"  {Colors.C}{k}{Colors.END}: {v}")
+                        # ── Analysis ───────────────────────────────────────────
+                        severity   = classify_severity(title, description, site_url)
+                        category   = classify_category(title, site_url)
+                        artefacts  = extract_artefacts(title + ' ' + description)
+                        scrape_data = None
 
-                if new_count == 0:
-                    print(f"  {Colors.GR}No new results.{Colors.END}")
+                        # ── Deep scrape ─────────────────────────────────────────
+                        if deep_scrape:
+                            try:
+                                scrape_data = dd._scrape_site(
+                                    site_url, headers, proxy_config,
+                                    scrape_images=False, debug_mode=debug_mode,
+                                    idx=len(all_results) + 1
+                                )
+                                # Enrich artefacts from scraped page text
+                                if scrape_data:
+                                    page_emails = scrape_data.get('emails', [])
+                                    if page_emails:
+                                        artefacts.setdefault('emails', [])
+                                        artefacts['emails'] = list(
+                                            dict.fromkeys(artefacts['emails'] + page_emails)
+                                        )[:20]
+                            except Exception as e:
+                                if debug_mode:
+                                    print(f"    {Colors.O}[scrape error] {e}{Colors.END}")
 
-            except KeyboardInterrupt:
-                print(f"{Colors.BOLD + Colors.R} Quitting... {Colors.END}")
+                        enriched = {
+                            'title':       title,
+                            'description': description,
+                            'site_url':    site_url,
+                            'engine':      eng['name'],
+                            'breach_query': query,
+                            'severity':    severity,
+                            'category':    category,
+                            'artefacts':   artefacts,
+                            'scrape_data': scrape_data,
+                        }
+                        all_results.append(enriched)
+
+                        sev_col = SEVERITY_COLOR.get(severity, Colors.GR)
+                        print(
+                            f"  {sev_col}[{severity}]{Colors.END} "
+                            f"{Colors.P}{title}{Colors.END}\n"
+                            f"  {Colors.GR}{site_url}{Colors.END}\n"
+                            f"  {Colors.GR}category={category}{Colors.END}"
+                        )
+                        if artefacts:
+                            for k, v in artefacts.items():
+                                print(f"  {Colors.C}{k}{Colors.END}: {v}")
+
+                    if new_count == 0:
+                        if search_all:
+                            print(f"  {Colors.GR}[{eng['name']}] no new results.{Colors.END}")
+                        else:
+                            print(f"  {Colors.GR}No new results.{Colors.END}")
+
+                except KeyboardInterrupt:
+                    print(f"{Colors.BOLD + Colors.R} Quitting... {Colors.END}")
+                    interrupted = True
+                    break
+                except Exception as e:
+                    if search_all:
+                        print(f"  {Colors.BOLD + Colors.O}[{eng['name']}] error: {e}{Colors.END}")
+                    else:
+                        print(f"  {Colors.BOLD + Colors.O}Error: {e}{Colors.END}")
+                    if debug_mode:
+                        import traceback
+                        traceback.print_exc()
+
+            if interrupted:
                 break
-            except Exception as e:
-                print(f"  {Colors.BOLD + Colors.O}Error: {e}{Colors.END}")
-                if debug_mode:
-                    import traceback
-                    traceback.print_exc()
 
             # Rate limit between queries
             if q_idx < len(queries):
@@ -1761,9 +2659,11 @@ class Darkdump(object):
 
         severity_counts = {}
         category_counts = {}
+        engine_counts   = {}
         for r in all_results:
             severity_counts[r['severity']]  = severity_counts.get(r['severity'], 0) + 1
             category_counts[r['category']]  = category_counts.get(r['category'], 0) + 1
+            engine_counts[r['engine']]      = engine_counts.get(r['engine'], 0) + 1
 
         print(f"\n{Colors.BOLD + Colors.C}[ Breach Intel Complete ]{Colors.END}")
         print(f"{Colors.BOLD}Total unique results : {Colors.END}{len(all_results)}")
@@ -1778,6 +2678,9 @@ class Darkdump(object):
         if category_counts:
             cats = ', '.join(f"{k}={v}" for k, v in sorted(category_counts.items()))
             print(f"{Colors.BOLD}By category          : {Colors.END}{cats}")
+        if search_all and engine_counts:
+            engs = ', '.join(f"{k}={v}" for k, v in sorted(engine_counts.items()))
+            print(f"{Colors.BOLD}By engine            : {Colors.END}{engs}")
 
         if output_file and all_results:
             ext = os.path.splitext(output_file)[1].lower()
@@ -1790,10 +2693,12 @@ class Darkdump(object):
                     'result_count': len(all_results),
                     'severity_summary':  severity_counts,
                     'category_summary':  category_counts,
+                    'engine_summary':    engine_counts,
                     'results': [
                         {
                             'title':        r['title'],
                             'url':          r['site_url'],
+                            'engine':       r['engine'],
                             'description':  r['description'],
                             'breach_query': r['breach_query'],
                             'severity':     r['severity'],
@@ -1815,7 +2720,7 @@ class Darkdump(object):
                     saver.add(
                         r['title'],
                         f"[{r['severity']}][{r['category']}] "
-                        f"query={r['breach_query']} | {r['description']} | "
+                        f"engine={r['engine']} | query={r['breach_query']} | {r['description']} | "
                         f"artefacts={r['artefacts']}",
                         r['site_url'],
                     )
@@ -1858,6 +2763,15 @@ def darkdump_main():
     parser.add_argument("-s", "--scrape",  help="scrape the actual site for content and look for keywords", action="store_true")
     parser.add_argument("-d", "--debug",   help="enable debug output", action="store_true")
     parser.add_argument("-u", "--unique",  help="hide duplicate results that share the same title and description (metadata-based deduplication)", action="store_true")
+    parser.add_argument(
+        "--live",
+        help=(
+            "only list live results: probe every result link over Tor before it is printed and "
+            "skip the onions that no longer respond. works with normal searches and --breach; "
+            "the Tor proxy is enabled automatically. example: darkdump.py -q wiki -e ahmia --live"
+        ),
+        action="store_true",
+    )
     parser.add_argument("-e", "--engine",  help=engine_help, type=str, default='ahmia',
                         choices=Configuration.VALID_ENGINES + ['all'], metavar='ENGINE')
     parser.add_argument(
@@ -1868,7 +2782,8 @@ def darkdump_main():
             "paste-site operators, hash types, username permutations, and stealer log terms. "
             "extracts credential artefacts from result snippets and classifies results by "
             "severity (CRITICAL/HIGH/MEDIUM/INFO) and category (paste-site/forum/market/leak-index). "
-            "example: darkdump.py --breach -q admin@example.com -e notevil -p"
+            "example: darkdump.py --breach -q admin@example.com -e notevil -p "
+            "(pass -e all to sweep every configured engine)"
         ),
         action="store_true",
     )
@@ -1895,15 +2810,89 @@ def darkdump_main():
         ),
         type=str, default=None, metavar='FILE',
     )
+    parser.add_argument(
+        "--crawl",
+        help=(
+            "crawl a whole site directly from a URL — no search query needed. follows same-host links "
+            "up to --depth, seeds robots.txt/sitemap.xml, optionally probes --wordlist paths, and saves "
+            "every reachable page plus a URL index under dd_crawl_dump/. .onion URLs automatically use "
+            "the Tor proxy. example: --crawl http://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion"
+        ),
+        type=str, default=None, metavar='URL',
+    )
+    parser.add_argument(
+        "--depth",
+        help="maximum link depth to follow when crawling (default: 3)",
+        type=int, default=3, metavar='N',
+    )
+    parser.add_argument(
+        "--max-pages",
+        help="stop after this many page requests when crawling (default: 200)",
+        type=int, default=200, dest='max_pages', metavar='N',
+    )
+    parser.add_argument(
+        "--delay",
+        help="seconds to wait between crawl requests, to stay polite over Tor (default: 2.0)",
+        type=float, default=2.0, metavar='SECONDS',
+    )
+    parser.add_argument(
+        "--wordlist",
+        help=(
+            "also probe guessed paths from this wordlist file when crawling, to find pages that are "
+            "not linked anywhere (example: /usr/share/wordlists/dirb/common.txt). much slower over Tor."
+        ),
+        type=str, default=None, metavar='FILE',
+    )
+    parser.add_argument(
+        "--urls-only",
+        help=(
+            "with --crawl: build the full URL inventory from robots.txt + the whole sitemap tree "
+            "(every board, thread and page) without downloading any pages. writes urls.txt and "
+            "urls.json under dd_crawl_dump/<host>/. fast — minutes even for thousands of URLs"
+        ),
+        action='store_true',
+    )
+    parser.add_argument(
+        "--url-list",
+        help=(
+            "with --crawl: download exactly the URLs listed in this file (one per line, e.g. the "
+            "generated urls.txt) instead of following links. combine with --max-pages and --resume "
+            "to download a large site in resumable batches"
+        ),
+        type=str, default=None, metavar='FILE',
+    )
+    parser.add_argument(
+        "--resume",
+        help=(
+            "with --crawl: skip URLs already downloaded by previous runs (tracked in "
+            "dd_crawl_dump/<host>/state.json) and continue the page-file numbering"
+        ),
+        action='store_true',
+    )
+    parser.add_argument(
+        "--no-rewrite",
+        help=(
+            "with --crawl: keep sitemap-declared hosts as-is instead of rewriting them onto the "
+            "crawl host. by default hosts declared in the site's own sitemaps are rewritten to "
+            "the target host"
+        ),
+        action='store_true',
+    )
+    parser.add_argument(
+        "--max-sitemaps",
+        help="with --crawl: maximum number of sitemap files to fetch (default: 300)",
+        type=int, default=300, metavar='N',
+    )
 
     args = parser.parse_args()
 
     if args.version:
         print(Colors.BOLD + Colors.B + f"Darkdump Version: {__version__}\n" + Colors.END)
 
-    if args.proxy and not args.scrape and not args.breach and not args.breach_deep:
+    if (args.proxy and not args.scrape and not args.breach
+            and not args.breach_deep and not args.crawl and not args.live):
         print(Colors.BOLD + Colors.R +
-              "Error: Proxy option '-p' must be used with the scraping option '-s' (or --breach)." + Colors.END)
+              "Error: Proxy option '-p' must be used with the scraping option '-s' (or --breach/--crawl/--live)." + Colors.END)
         parser.print_help()
         sys.exit(1)
 
@@ -1921,13 +2910,61 @@ def darkdump_main():
         fmt_name = {'.json': 'JSON', '.csv': 'CSV'}.get(fmt, 'TXT')
         print(f"{Colors.BOLD + Colors.C}[ Output: {args.output} ({fmt_name}) ]{Colors.END}")
 
-    if args.breach:
+    if args.crawl and (args.query or args.breach or args.breach_deep):
+        print(f"{Colors.BOLD + Colors.R}Error: --crawl crawls one site directly; "
+              f"it cannot be combined with -q/--query or --breach.{Colors.END}")
+        sys.exit(1)
+
+    if (args.urls_only or args.url_list or args.resume) and not args.crawl:
+        print(f"{Colors.BOLD + Colors.R}Error: --urls-only, --url-list and --resume "
+              f"must be used together with --crawl URL.{Colors.END}")
+        sys.exit(1)
+
+    if args.crawl:
+        if args.live:
+            print(f"{Colors.BOLD + Colors.O}Note: --live applies to search results; "
+                  f"--crawl already records whether each page responded.{Colors.END}")
+        Darkdump().crawl_site(
+            args.crawl,
+            depth=args.depth,
+            max_pages=args.max_pages,
+            delay=args.delay,
+            use_proxy=args.proxy,
+            wordlist=args.wordlist,
+            debug_mode=args.debug,
+            output_file=args.output,
+            urls_only=args.urls_only,
+            url_list=args.url_list,
+            resume=args.resume,
+            rewrite_host=not args.no_rewrite,
+            max_sitemaps=args.max_sitemaps,
+        )
+    elif args.breach:
         if not args.query:
             print(Colors.BOLD + Colors.R +
                   "Error: --breach requires a target via -q (email, domain, username, or keyword)." + Colors.END)
             sys.exit(1)
         engine = Configuration.SEARCH_ENGINES.get(args.engine, {})
-        if not engine.get('filtered', True):
+        if args.engine == 'all':
+            unfiltered_names = [
+                cfg['name'] for cfg in Configuration.SEARCH_ENGINES.values()
+                if not cfg.get('filtered', True)
+            ]
+            if unfiltered_names:
+                print(
+                    f"\n{Colors.BOLD + Colors.R}[!] WARNING: 'all' also queries unfiltered engines: "
+                    f"{', '.join(unfiltered_names)}.{Colors.END}\n"
+                    f"{Colors.BOLD + Colors.O}    Results may include illegal or harmful content. "
+                    f"Use for legitimate research only.{Colors.END}\n"
+                )
+                try:
+                    confirm = input(f"{Colors.BOLD}    Continue with all engines? [y/N]: {Colors.END}").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    confirm = 'n'
+                if confirm != 'y':
+                    print(f"{Colors.BOLD + Colors.R}Aborted.{Colors.END}")
+                    sys.exit(0)
+        elif not engine.get('filtered', True):
             print(
                 f"\n{Colors.BOLD + Colors.R}[!] WARNING: {engine.get('name', args.engine)} is an unfiltered engine.{Colors.END}\n"
                 f"{Colors.BOLD + Colors.O}    Results may include illegal or harmful content. "
@@ -1949,6 +2986,7 @@ def darkdump_main():
             output_file=args.output,
             deep_scrape=args.breach_deep,
             query_delay=args.breach_delay,
+            live_check=args.live,
         )
     elif args.query:
         print(
@@ -1966,6 +3004,7 @@ def darkdump_main():
             debug_mode=args.debug,
             output_file=args.output,
             dedupe=args.unique,
+            live_check=args.live,
         )
     else:
         print("[~] Note: No query arguments were passed. Please supply a query to search.")

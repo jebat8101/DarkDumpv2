@@ -5,6 +5,9 @@ __pycache__/
 # Scraper output (saved pages / scraped images)
 dd_scrape_image_dump/
 
+# Crawler output (saved pages / URL index)
+dd_crawl_dump/
+
 # Saved result files
 results.json
 results.csv
